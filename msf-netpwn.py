@@ -170,12 +170,15 @@ def update_sess_data(CLIENT, domain_data, session, sess_num):
             session[b'domain_joined'] = b'True'
             domain_data['domain'] = domain
         else:
+            domain = b'Not domain joined'
             session[b'domain_joined'] = b'False'
-        admin = is_admin(CLIENT, sess_num)
-        session[b'admin'] = admin
+        admin_shell, local_admin = is_admin(CLIENT, sess_num)
+        session[b'admin_shell'] = admin_shell
+        session[b'local_admin'] = local_admin
         print_info(info+' '+plat+' '+arch)
         print('        Domain: '+domain.decode('utf8'))
-        print('        Is admin: '+admin.decode('utf8'))
+        print('        Admin shell: '+admin_shell.decode('utf8'))
+        print('        Local admin: '+local_admin.decode('utf8'))
 
     return session, domain_data
 
@@ -186,17 +189,17 @@ def is_admin(CLIENT, sess_num):
     if output:
         split_out = output.decode('utf8').splitlines()
         user_info_list = split_out[5].split()
-        admin = user_info_list[0]
+        admin_shell = user_info_list[0]
         system = user_info_list[1]
-        in_local_admin = user_info_list[2]
+        local_admin = user_info_list[2]
         user = user_info_list[5]
 
-        # Byte string
-        return str(admin).encode()
+        # Byte strings
+        return str(admin_shell).encode(), str(local_admin).encode()
 
     else:
 
-        return b'ERROR'
+        return b'ERROR', b'ERROR'
 
 def get_domain_controller(CLIENT, domain_data, sess_num):
     print_info('Getting domain controller...')
@@ -301,7 +304,6 @@ def main(args):
     domain_data = {'domain':None, 'domain_controller':None, 'domain_admins':None}
     while True:
         sessions, domain_data = check_sessions(CLIENT, sessions, domain_data)
-        print(domain_data) #1111
         time.sleep(.5)
 
 if __name__ == "__main__":
