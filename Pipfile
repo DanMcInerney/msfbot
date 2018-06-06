@@ -1,0 +1,17 @@
+[[source]]
+url = "https://pypi.python.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[dev-packages]
+
+[packages]
+ipython = "*"
+netaddr = "*"
+termcolor = "*"
+netifaces = "*"
+requests = "*"
+msgpack = "*"
+
+[requires]
+python_version = "3.6"
