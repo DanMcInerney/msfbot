@@ -12,6 +12,7 @@ termcolor = "*"
 netifaces = "*"
 requests = "*"
 msgpack = "*"
+asyncio = "*"
 
 [requires]
 python_version = "3.6"

