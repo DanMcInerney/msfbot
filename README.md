@@ -18,7 +18,7 @@ cd msfrpc && python2 setup install && cd ..
 ```./msf-netpwn.py ```
 
 #### Current progress
-Async is working and error handling for when sessions die unexepectedly is in place. I think the error handling should probably be DRY'd out. But right now the script will start, wait for a session to be found, do recon on that session and if that session is domain-joined, it'll do domain recon like getting domain controllers and domain admins. It only does domain recon once. 
+Async is working and error handling for when sessions die unexepectedly is in place. I think the error handling should probably be DRY'd out. But right now the script will start, wait for a session to be found, do recon on that session and if that session is domain-joined, it'll do domain recon like getting domain controllers and domain admins. 
 
 #### To do
 * domain privesc
