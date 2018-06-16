@@ -28,25 +28,25 @@ def parse_args():
 # Colored terminal output
 def print_bad(msg, sess_num):
     if sess_num:
-        print(colored('[-] ', 'red') + 'Session {} - {}'.format(str(sess_num), msg))
+        print(colored('[-] ', 'red') + 'Session {} '.format(str(sess_num)).ljust(12)+'- '+msg)
     else:
         print(colored('[-] ', 'red') + msg)
 
 def print_info(msg, sess_num):
     if sess_num:
-        print(colored('[*] ', 'blue') + 'Session {} - {}'.format(str(sess_num), msg))
+        print(colored('[*] ', 'blue') + 'Session {} '.format(str(sess_num)).ljust(12)+'- '+msg)
     else:
         print(colored('[*] ', 'blue') + msg)
 
 def print_good(msg, sess_num):
     if sess_num:
-        print(colored('[+] ', 'green') + 'Session {} - {}'.format(str(sess_num), msg))
+        print(colored('[+] ', 'green') + 'Session {} '.format(str(sess_num)).ljust(12)+'- '+msg)
     else:
         print(colored('[+] ', 'green') + msg)
 
 def print_great(msg, sess_num):
     if sess_num:
-        print(colored('[*] ', 'yellow', attrs=['bold']) + 'Session {} - {}'.format(str(sess_num), msg))
+        print(colored('[*] ', 'yellow', attrs=['bold']) + 'Session {} '.format(str(sess_num)).ljust(12)+'- '+msg)
     else:
         print(colored('[!] ', 'yellow') + msg)
 
@@ -301,13 +301,9 @@ def update_session(session, sess_num):
     if sess_num in NEW_SESS_DATA:
         # Update session with the new key:value's in NEW_SESS_DATA
         # This will not change any of the MSF session data, just add new key:value pairs
-        session = add_session_keys(session)
-        # Update NEW_SESS_DATA with any changes from the original session data
-        NEW_SESS_DATA[sess_num] = session
+        NEW_SESS_DATA[sess_num] = add_session_keys(session)
     else:
         NEW_SESS_DATA[sess_num] = session
-
-    return NEW_SESS_DATA[sess_num]
 
 async def gather_passwords(client, sess_num):
     #mimikatz
@@ -316,6 +312,9 @@ async def gather_passwords(client, sess_num):
     pass
 
 async def attack(client, sess_num):
+
+    # Make sure it got the admin_shell info added
+    #if b'admin_shell' in NEW_SESS_DATA[sess_num]:
 
     # Is admin
     if NEW_SESS_DATA[sess_num][b'admin_shell'] == b'True':
@@ -357,8 +356,8 @@ async def attack_with_session(client, session, sess_num):
     if task:
         await asyncio.wait(task)
 
-    await attack(client, sess_num)
-
+    if is_session_broken(sess_num) == False:
+        await attack(client, sess_num)
 
 def get_output(client, cmd, sess_num):
     output = client.call('session.meterpreter_read', [str(sess_num)])
@@ -386,7 +385,7 @@ def get_output_errors(output, counter, cmd, sess_num, timeout, sleep_secs):
 
     # Got an error from output
     if any(x in output.lower() for x in script_errors):
-        print_bad('Command [{}] failed with error: {}'.format(cmd, output.decode('utf8')), sess_num)
+        print_bad('Command [{}] failed with error: {}'.format(cmd, output.decode('utf8').strip()), sess_num)
         return cmd, counter
 
     # If no terminating string specified just wait til timeout
@@ -474,33 +473,32 @@ def get_perm_token(client):
     client.token = '123'
     return client
 
-def filter_broken_sessions():
+def is_session_broken(sess_num):
     ''' We remove 2 kinds of errored sessions: 1) timed out on sysinfo 2) shell died abruptly '''
-    unbroken_sessions = {}
+    global NEW_SESS_DATA
 
-    for s in NEW_SESSION_DATA:
-        if b'error' in NEW_SESSION_DATA[s]:
-            # Session timed out on initial sysinfo cmd
-            if b'domain' not in NEW_SESSION_DATA:
-                continue
-            # Session abruptly died
-            elif NEW_SESSION_DATA[s][b'error'] == b'exception below likely due to abrupt death of session':
-                continue
+    if b'error' in NEW_SESS_DATA[sess_num]:
+        # Session timed out on initial sysinfo cmd
+        if b'domain' not in NEW_SESS_DATA:
+            return True
+        # Session abruptly died
+        elif NEW_SESS_DATA[s][b'error'] == b'exception below likely due to abrupt death of session':
+            return True
+        # Session timed out
+        elif 'Rex::TimeoutError' in NEW_SESS_DATA[s][b'error']:
+            return True
 
-        unbroken_sessions[s] = NEW_SESSION_DATA[s]
-
-    NEW_SESSION_DATA = unbroken_sessions
+    return False
 
 def add_session_keys(session, sess_num):
-    #filter_broken_sessions(updated_sessions)
-    for k in NEW_SESSION_DATA[s]:
+    for k in NEW_SESS_DATA[s]:
         if k not in session:
-            session[k] = NEW_SESSION_DATA[sess_num].get(k)
+            session[k] = NEW_SESS_DATA[sess_num].get(k)
 
-    return sessions
+    return session
 
 async def check_for_sessions(client, loop):
-    global NEW_SESSION_DATA
+    global NEW_SESS_DATA
 
     print_info('Waiting for Meterpreter shell', None)
 
