@@ -972,10 +972,12 @@ def parse_hostlist(args):
             report = NmapParser.parse_fromfile(args.xml)
             for host in report.hosts:
                 if host.is_up():
-                    if s.port == 445:
-                        if s.state == 'open':
-                            if host not in hosts:
-                                hosts.append(host)
+                    for s in host.services:
+                        if s.port == 445:
+                            if s.state == 'open':
+                                host = host.address
+                                if host not in hosts:
+                                    hosts.append(host)
         except FileNotFoundError:
             print_bad('Host file not found: {}'.format(args.xml))
             sys.exit()

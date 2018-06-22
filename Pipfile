@@ -13,6 +13,7 @@ netifaces = "*"
 requests = "*"
 msgpack = "*"
 asyncio = "*"
+python-libnmap = "*"
 
 [requires]
 python_version = "3.6"
