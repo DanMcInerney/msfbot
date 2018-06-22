@@ -15,6 +15,7 @@ from IPython import embed
 from termcolor import colored
 from netaddr import IPNetwork, AddrFormatError
 from subprocess import Popen, PIPE, CalledProcessError
+from libnmap.parser import NmapParser, NmapParserException
 
 NEW_SESS_DATA = {}
 DOMAIN_DATA = {'domain':None, 
