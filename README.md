@@ -18,13 +18,9 @@ cd msfrpc && python2 setup install && cd ..
 ```./msf-netpwn.py ```
 
 #### Current progress
-Async is working and error handling for when sessions die unexepectedly is in place. I think the error handling should probably be DRY'd out. But right now the script will start, wait for a session to be found, do recon on that session and if that session is domain-joined, it'll do domain recon like getting domain controllers and domain admins. 
+Listens for session, performs AV-resistant domain recon (with wmic), lateral spread, does mimikatz/hashdump, does lateral movement with psexec_psh.
 
 #### To do
-* domain privesc
-** ms14-068? that might be hard to implement
-** GPP
-* mimikatz boxes with admin shells
-* basic privesc if user is not admin
-* get spreading function working (include AMSI bypass)
-* Long-term: incorporate BloodHound graph CSV ingestion for more efficient attack pathing
+* Needs a lot more testing, only have a couple windows labs to test this in
+* Need to change lateral movement to something more red teamy than psexec_psh, maybe use the LOLbin extexport.exe to remotely load a shelltered payload on remote box using wmic?
+* Add --stealth flag. Have it work for speed normally unless this switch is given and then use red team tactics instead.
